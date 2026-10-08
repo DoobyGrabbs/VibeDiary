@@ -8,9 +8,67 @@ use serde::{Deserialize, Serialize};
 const BLUE: Color32 = Color32::from_rgb(37, 99, 235);
 const BLUE_HOVER: Color32 = Color32::from_rgb(29, 78, 216);
 const RED: Color32 = Color32::from_rgb(220, 38, 38);
-const PAGE_BG: Color32 = Color32::from_rgb(240, 247, 255);
 const GREY: [u8; 3] = [156, 163, 175];
-const INK: Color32 = Color32::from_rgb(30, 41, 59);
+
+/// Colours that differ between light and dark mode.
+struct Palette {
+    page_bg: Color32,
+    panel_bg: Color32,
+    header: Color32,
+    accent: Color32,
+    cell: Color32,
+    cell_border: Color32,
+    weekend: Color32,
+    today: Color32,
+    hover: Color32,
+    head_bg: Color32,
+    head_text: Color32,
+    day_num: Color32,
+    muted: Color32,
+    title: Color32,
+    ink: Color32,
+}
+
+fn palette(ctx: &egui::Context) -> Palette {
+    let c = |r, g, b| Color32::from_rgb(r, g, b);
+    if ctx.theme() == egui::Theme::Dark {
+        Palette {
+            page_bg: c(15, 23, 42),
+            panel_bg: c(30, 41, 59),
+            header: c(30, 58, 138),
+            accent: c(96, 165, 250),
+            cell: c(30, 41, 59),
+            cell_border: c(71, 85, 105),
+            weekend: c(22, 33, 62),
+            today: c(20, 83, 45),
+            hover: c(66, 56, 20),
+            head_bg: c(30, 58, 138),
+            head_text: c(191, 219, 254),
+            day_num: c(226, 232, 240),
+            muted: c(148, 163, 184),
+            title: c(147, 197, 253),
+            ink: c(241, 245, 249),
+        }
+    } else {
+        Palette {
+            page_bg: c(240, 247, 255),
+            panel_bg: Color32::WHITE,
+            header: BLUE,
+            accent: BLUE,
+            cell: Color32::WHITE,
+            cell_border: c(203, 213, 225),
+            weekend: c(224, 242, 254),
+            today: c(220, 252, 231),
+            hover: c(254, 249, 195),
+            head_bg: c(219, 234, 254),
+            head_text: c(30, 64, 175),
+            day_num: c(51, 65, 85),
+            muted: c(71, 85, 105),
+            title: c(30, 64, 175),
+            ink: c(30, 41, 59),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Category {
@@ -209,12 +267,13 @@ impl DiaryApp {
         let cell_h = ((avail.y - head_h) / rows as f32).max(70.0);
         let (grid, _) = ui.allocate_exact_size(vec2(avail.x, head_h + cell_h * rows as f32), Sense::hover());
         let painter = ui.painter_at(grid);
+        let p = palette(ui.ctx());
         let today = Local::now().date_naive();
 
         for (i, name) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().enumerate() {
             let r = egui::Rect::from_min_size(grid.min + vec2(cell_w * i as f32, 0.0), vec2(cell_w, head_h));
-            painter.rect_filled(r.shrink(1.0), 4.0, Color32::from_rgb(219, 234, 254));
-            painter.text(r.center(), Align2::CENTER_CENTER, *name, FontId::proportional(16.0), Color32::from_rgb(30, 64, 175));
+            painter.rect_filled(r.shrink(1.0), 4.0, p.head_bg);
+            painter.text(r.center(), Align2::CENTER_CENTER, *name, FontId::proportional(16.0), p.head_text);
         }
 
         let mut clicked = None;
@@ -231,19 +290,19 @@ impl DiaryApp {
 
             let resp = ui.interact(rect, ui.id().with(("day", n)), Sense::click());
             let bg = if day == today {
-                Color32::from_rgb(220, 252, 231)
+                p.today
             } else if col >= 5 {
-                Color32::from_rgb(224, 242, 254)
+                p.weekend
             } else if resp.hovered() {
-                Color32::from_rgb(254, 249, 195)
+                p.hover
             } else {
-                Color32::WHITE
+                p.cell
             };
             painter.rect_filled(rect, 6.0, bg);
             let border = if day == self.selected {
-                Stroke::new(2.5, BLUE)
+                Stroke::new(2.5, p.accent)
             } else {
-                Stroke::new(1.0, Color32::from_rgb(203, 213, 225))
+                Stroke::new(1.0, p.cell_border)
             };
             painter.rect_stroke(rect, 6.0, border, egui::StrokeKind::Inside);
             painter.text(
@@ -251,7 +310,7 @@ impl DiaryApp {
                 Align2::LEFT_TOP,
                 day.day().to_string(),
                 FontId::proportional(19.0),
-                Color32::from_rgb(51, 65, 85),
+                p.day_num,
             );
 
             let entries = self.day_entries(day);
@@ -280,7 +339,7 @@ impl DiaryApp {
                     Align2::LEFT_CENTER,
                     format!("+{} more", entries.len() - shown),
                     FontId::proportional(14.0),
-                    Color32::from_rgb(71, 85, 105),
+                    p.muted,
                 );
             }
 
@@ -305,8 +364,9 @@ impl DiaryApp {
     }
 
     fn day_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new(self.selected.format("%A").to_string()).size(14.0).color(Color32::from_rgb(71, 85, 105)));
-        ui.label(RichText::new(self.selected.format("%e %B %Y").to_string()).size(22.0).strong().color(Color32::from_rgb(30, 64, 175)));
+        let p = palette(ui.ctx());
+        ui.label(RichText::new(self.selected.format("%A").to_string()).size(14.0).color(p.muted));
+        ui.label(RichText::new(self.selected.format("%e %B %Y").to_string()).size(22.0).strong().color(p.title));
         ui.add_space(6.0);
         if ui.button("➕ Add entry for this day").clicked() {
             self.new_entry(self.selected);
@@ -369,6 +429,7 @@ impl DiaryApp {
     }
 
     fn entry_window(&mut self, ctx: &egui::Context) {
+        let p = palette(ctx);
         let Some(ed) = &mut self.editor else { return };
         let cats = &self.data.categories;
         let mut open = true;
@@ -378,7 +439,9 @@ impl DiaryApp {
         egui::Window::new(if ed.id.is_some() { "Edit entry" } else { "New entry" })
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
+            .default_size([480.0, 380.0])
+            .min_size([320.0, 240.0])
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(RichText::new(ed.date.format("%A, %e %B %Y").to_string()).strong());
@@ -400,12 +463,13 @@ impl DiaryApp {
                         });
                 });
                 ui.add_space(6.0);
-                ui.add(
+                // Fill the window, leaving room for the buttons underneath.
+                let height = (ui.available_height() - 44.0).max(80.0);
+                ui.add_sized(
+                    [ui.available_width(), height],
                     egui::TextEdit::multiline(&mut ed.text)
-                        .desired_rows(8)
-                        .desired_width(380.0)
                         .hint_text("What's on your mind?")
-                        .text_color(INK),
+                        .text_color(p.ink),
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -448,6 +512,7 @@ impl DiaryApp {
     }
 
     fn categories_window(&mut self, ctx: &egui::Context) {
+        let p = palette(ctx);
         if !self.show_categories {
             return;
         }
@@ -459,53 +524,75 @@ impl DiaryApp {
         egui::Window::new("Categories")
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
+            .default_size([520.0, 420.0])
+            .min_size([360.0, 260.0])
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 let can_delete = self.data.categories.len() > 1;
                 let names: Vec<String> = self.data.categories.iter().map(|c| c.name.clone()).collect();
-                egui::Grid::new("cats").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
-                    for (i, c) in self.data.categories.iter_mut().enumerate() {
+                let big = FontId::proportional(22.0);
+                let field_margin = egui::Margin::symmetric(10, 8);
+                for (i, c) in self.data.categories.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
                         changed |= ui.color_edit_button_srgb(&mut c.color).changed();
 
-                        // Edit a buffered copy and only apply the rename when editing finishes.
-                        let mut text = match &self.rename_buf {
-                            Some((j, b)) if *j == i => b.clone(),
-                            _ => c.name.clone(),
-                        };
-                        let resp = ui.add(egui::TextEdit::singleline(&mut text).text_color(INK).desired_width(200.0));
-                        if resp.changed() {
-                            self.rename_buf = Some((i, text));
-                        } else if resp.lost_focus() {
-                            if let Some((j, new)) = self.rename_buf.take() {
-                                let new = new.trim().to_string();
-                                let clash = names.iter().enumerate().any(|(k, n)| k != j && n.eq_ignore_ascii_case(&new));
-                                if j == i && !new.is_empty() && !clash && new != c.name {
-                                    renames.push((std::mem::replace(&mut c.name, new.clone()), new));
+                        // Delete sits at the right edge; the name field takes the space in between.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let del = egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(RED);
+                            if ui.add_enabled(can_delete, del).clicked() {
+                                remove = Some(i);
+                            }
+
+                            // Edit a buffered copy and only apply the rename when editing finishes.
+                            let mut text = match &self.rename_buf {
+                                Some((j, b)) if *j == i => b.clone(),
+                                _ => c.name.clone(),
+                            };
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut text)
+                                    .font(big.clone())
+                                    .margin(field_margin)
+                                    .text_color(p.ink)
+                                    .desired_width(ui.available_width()),
+                            );
+                            if resp.changed() {
+                                self.rename_buf = Some((i, text));
+                            } else if resp.lost_focus() {
+                                if let Some((j, new)) = self.rename_buf.take() {
+                                    let new = new.trim().to_string();
+                                    let clash = names.iter().enumerate().any(|(k, n)| k != j && n.eq_ignore_ascii_case(&new));
+                                    if j == i && !new.is_empty() && !clash && new != c.name {
+                                        renames.push((std::mem::replace(&mut c.name, new.clone()), new));
+                                    }
                                 }
                             }
-                        }
-
-                        let del = egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(RED);
-                        if ui.add_enabled(can_delete, del).clicked() {
-                            remove = Some(i);
-                        }
-                        ui.end_row();
-                    }
-                });
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
                 ui.weak("Click a name to rename it; press Enter to apply.");
                 ui.separator();
                 ui.label("Add a category");
                 ui.horizontal(|ui| {
                     ui.color_edit_button_srgb(&mut self.new_cat_color);
-                    ui.add(egui::TextEdit::singleline(&mut self.new_cat_name).hint_text("Name").text_color(INK).desired_width(160.0));
-                    let name = self.new_cat_name.trim().to_string();
-                    let dup = self.data.categories.iter().any(|c| c.name.eq_ignore_ascii_case(&name));
-                    if ui.add_enabled(!name.is_empty() && !dup, egui::Button::new("Add")).clicked() {
-                        self.data.categories.push(Category { name, color: self.new_cat_color });
-                        self.new_cat_name.clear();
-                        changed = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let name = self.new_cat_name.trim().to_string();
+                        let dup = self.data.categories.iter().any(|c| c.name.eq_ignore_ascii_case(&name));
+                        if ui.add_enabled(!name.is_empty() && !dup, egui::Button::new("Add")).clicked() {
+                            self.data.categories.push(Category { name, color: self.new_cat_color });
+                            self.new_cat_name.clear();
+                            changed = true;
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.new_cat_name)
+                                .font(big.clone())
+                                .margin(field_margin)
+                                .hint_text("Name")
+                                .text_color(p.ink)
+                                .desired_width(ui.available_width()),
+                        );
+                    });
                 });
                 ui.weak("Entries in a deleted category show in grey.");
             });
@@ -532,14 +619,19 @@ impl DiaryApp {
     }
 }
 
-fn setup_style(ctx: &egui::Context) {
-    let mut v = egui::Visuals::light();
-    v.panel_fill = PAGE_BG;
-    v.window_fill = Color32::WHITE;
+fn make_visuals(dark: bool) -> egui::Visuals {
+    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    let (page, window, stroke) = if dark {
+        (Color32::from_rgb(15, 23, 42), Color32::from_rgb(30, 41, 59), Color32::from_rgb(148, 163, 184))
+    } else {
+        (Color32::from_rgb(240, 247, 255), Color32::WHITE, Color32::from_rgb(100, 116, 139))
+    };
+    v.panel_fill = page;
+    v.window_fill = window;
     v.window_corner_radius = 0.into();
-    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(100, 116, 139));
-    v.window_shadow = egui::Shadow { offset: [0, 10], blur: 32, spread: 4, color: Color32::from_black_alpha(150) };
-    v.extreme_bg_color = Color32::WHITE;
+    v.window_stroke = Stroke::new(1.0, stroke);
+    v.window_shadow = egui::Shadow { offset: [0, 10], blur: 32, spread: 4, color: Color32::from_black_alpha(if dark { 220 } else { 150 }) };
+    v.extreme_bg_color = if dark { Color32::from_rgb(15, 23, 42) } else { Color32::WHITE };
     for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
         w.corner_radius = 8.into();
         w.fg_stroke = Stroke::new(1.0, Color32::WHITE);
@@ -550,8 +642,15 @@ fn setup_style(ctx: &egui::Context) {
     v.widgets.hovered.bg_fill = BLUE_HOVER;
     v.widgets.active.weak_bg_fill = BLUE_HOVER;
     v.widgets.active.bg_fill = BLUE_HOVER;
-    v.selection.bg_fill = Color32::from_rgb(147, 197, 253);
-    ctx.set_visuals(v);
+    v.selection.bg_fill = if dark { Color32::from_rgb(30, 64, 175) } else { Color32::from_rgb(147, 197, 253) };
+    v
+}
+
+fn setup_style(ctx: &egui::Context) {
+    // Follow the system light/dark setting.
+    ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::System);
+    ctx.set_visuals_of(egui::Theme::Light, make_visuals(false));
+    ctx.set_visuals_of(egui::Theme::Dark, make_visuals(true));
     ctx.global_style_mut(|s| {
         s.spacing.button_padding = vec2(12.0, 6.0);
         for font in s.text_styles.values_mut() {
@@ -563,15 +662,16 @@ fn setup_style(ctx: &egui::Context) {
 impl eframe::App for DiaryApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let p = palette(&ctx);
         egui::Panel::top("header")
-            .frame(egui::Frame::new().fill(BLUE).inner_margin(egui::Margin::symmetric(14, 10)))
+            .frame(egui::Frame::new().fill(p.header).inner_margin(egui::Margin::symmetric(14, 10)))
             .show(ui, |ui| self.header(ui));
         egui::Panel::right("day")
             .default_size(330.0)
-            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(14))
+            .frame(egui::Frame::new().fill(p.panel_bg).inner_margin(14))
             .show(ui, |ui| self.day_panel(ui));
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(PAGE_BG).inner_margin(10))
+            .frame(egui::Frame::new().fill(p.page_bg).inner_margin(10))
             .show(ui, |ui| self.calendar(ui));
 
         self.entry_window(&ctx);
