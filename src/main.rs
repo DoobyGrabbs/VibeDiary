@@ -10,6 +10,7 @@ const BLUE_HOVER: Color32 = Color32::from_rgb(29, 78, 216);
 const RED: Color32 = Color32::from_rgb(220, 38, 38);
 const PAGE_BG: Color32 = Color32::from_rgb(240, 247, 255);
 const GREY: [u8; 3] = [156, 163, 175];
+const INK: Color32 = Color32::from_rgb(30, 41, 59);
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Category {
@@ -210,7 +211,7 @@ impl DiaryApp {
         for (i, name) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().enumerate() {
             let r = egui::Rect::from_min_size(grid.min + vec2(cell_w * i as f32, 0.0), vec2(cell_w, head_h));
             painter.rect_filled(r.shrink(1.0), 4.0, Color32::from_rgb(219, 234, 254));
-            painter.text(r.center(), Align2::CENTER_CENTER, *name, FontId::proportional(15.0), Color32::from_rgb(30, 64, 175));
+            painter.text(r.center(), Align2::CENTER_CENTER, *name, FontId::proportional(16.0), Color32::from_rgb(30, 64, 175));
         }
 
         let mut clicked = None;
@@ -246,12 +247,12 @@ impl DiaryApp {
                 rect.min + vec2(8.0, 6.0),
                 Align2::LEFT_TOP,
                 day.day().to_string(),
-                FontId::proportional(17.0),
+                FontId::proportional(19.0),
                 Color32::from_rgb(51, 65, 85),
             );
 
             let entries = self.day_entries(day);
-            let pill_h = 18.0;
+            let pill_h = 21.0;
             let top = rect.min.y + 30.0;
             let fit = (((rect.max.y - top - 4.0) / (pill_h + 2.0)).floor() as usize).max(1);
             let shown = if entries.len() > fit { fit - 1 } else { entries.len() };
@@ -266,7 +267,7 @@ impl DiaryApp {
                     egui::pos2(pr.min.x + 7.0, pr.center().y),
                     Align2::LEFT_CENTER,
                     format!("{} {}", &e.added_at[11..16.min(e.added_at.len())], first_line(&e.text)),
-                    FontId::proportional(12.0),
+                    FontId::proportional(14.0),
                     text_on(c),
                 );
             }
@@ -275,7 +276,7 @@ impl DiaryApp {
                     egui::pos2(rect.min.x + 8.0, top + shown as f32 * (pill_h + 2.0) + pill_h / 2.0),
                     Align2::LEFT_CENTER,
                     format!("+{} more", entries.len() - shown),
-                    FontId::proportional(12.0),
+                    FontId::proportional(14.0),
                     Color32::from_rgb(71, 85, 105),
                 );
             }
@@ -400,7 +401,8 @@ impl DiaryApp {
                     egui::TextEdit::multiline(&mut ed.text)
                         .desired_rows(8)
                         .desired_width(380.0)
-                        .hint_text("What's on your mind?"),
+                        .hint_text("What's on your mind?")
+                        .text_color(INK),
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -471,7 +473,7 @@ impl DiaryApp {
                 ui.label("Add a category");
                 ui.horizontal(|ui| {
                     ui.color_edit_button_srgb(&mut self.new_cat_color);
-                    ui.add(egui::TextEdit::singleline(&mut self.new_cat_name).hint_text("Name").desired_width(160.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.new_cat_name).hint_text("Name").text_color(INK).desired_width(160.0));
                     let name = self.new_cat_name.trim().to_string();
                     let dup = self.data.categories.iter().any(|c| c.name.eq_ignore_ascii_case(&name));
                     if ui.add_enabled(!name.is_empty() && !dup, egui::Button::new("Add")).clicked() {
@@ -515,7 +517,12 @@ fn setup_style(ctx: &egui::Context) {
     v.widgets.active.bg_fill = BLUE_HOVER;
     v.selection.bg_fill = Color32::from_rgb(147, 197, 253);
     ctx.set_visuals(v);
-    ctx.global_style_mut(|s| s.spacing.button_padding = vec2(10.0, 5.0));
+    ctx.global_style_mut(|s| {
+        s.spacing.button_padding = vec2(12.0, 6.0);
+        for font in s.text_styles.values_mut() {
+            font.size *= 1.25;
+        }
+    });
 }
 
 impl eframe::App for DiaryApp {
