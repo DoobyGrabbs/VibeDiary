@@ -5,6 +5,8 @@ use chrono::{Datelike, Local, NaiveDate};
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke, vec2};
 use serde::{Deserialize, Serialize};
 
+mod icon;
+
 const BLUE: Color32 = Color32::from_rgb(37, 99, 235);
 const BLUE_HOVER: Color32 = Color32::from_rgb(29, 78, 216);
 const RED: Color32 = Color32::from_rgb(220, 38, 38);
@@ -432,19 +434,23 @@ impl DiaryApp {
         let p = palette(ctx);
         let Some(ed) = &mut self.editor else { return };
         let cats = &self.data.categories;
-        let mut open = true;
+        let dark = ctx.theme() == egui::Theme::Dark;
         let mut save_it = false;
         let mut cancel = false;
 
         egui::Window::new(if ed.id.is_some() { "Edit entry" } else { "New entry" })
-            .open(&mut open)
-            .collapsible(false)
+            .title_bar(false)
+            .frame(popup_frame(&p, dark))
             .resizable(true)
             .default_size([480.0, 380.0])
             .min_size([320.0, 240.0])
             .pivot(Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
+                if popup_header(ui, &p, if ed.id.is_some() { "Edit entry" } else { "New entry" }) {
+                    cancel = true;
+                }
+                egui::Frame::new().inner_margin(14).show(ui, |ui| {
                 ui.label(RichText::new(ed.date.format("%A, %e %B %Y").to_string()).strong());
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -465,7 +471,7 @@ impl DiaryApp {
                 });
                 ui.add_space(6.0);
                 // Fill the window, leaving room for the buttons underneath.
-                let height = (ui.available_height() - 44.0).max(80.0);
+                let height = (ui.available_height() - 58.0).max(80.0);
                 ui.add_sized(
                     [ui.available_width(), height],
                     egui::TextEdit::multiline(&mut ed.text)
@@ -481,6 +487,7 @@ impl DiaryApp {
                     if ui.button("Cancel").clicked() {
                         cancel = true;
                     }
+                });
                 });
             });
 
@@ -507,7 +514,7 @@ impl DiaryApp {
             }
             self.selected = ed.date;
             self.persist();
-        } else if cancel || !open {
+        } else if cancel {
             self.editor = None;
         }
     }
@@ -518,19 +525,24 @@ impl DiaryApp {
             return;
         }
         let mut open = true;
+        let dark = ctx.theme() == egui::Theme::Dark;
         let mut changed = false;
         let mut remove = None;
         let mut renames: Vec<(String, String)> = Vec::new();
 
         egui::Window::new("Categories")
-            .open(&mut open)
-            .collapsible(false)
+            .title_bar(false)
+            .frame(popup_frame(&p, dark))
             .resizable(true)
             .default_size([520.0, 420.0])
             .min_size([360.0, 260.0])
             .pivot(Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
+                if popup_header(ui, &p, "Categories") {
+                    open = false;
+                }
+                egui::Frame::new().inner_margin(14).show(ui, |ui| {
                 let can_delete = self.data.categories.len() > 1;
                 let names: Vec<String> = self.data.categories.iter().map(|c| c.name.clone()).collect();
                 let big = FontId::proportional(18.0);
@@ -604,6 +616,7 @@ impl DiaryApp {
                     });
                 });
                 ui.weak("Entries in a deleted category show in grey.");
+                });
             });
 
         for (old, new) in renames {
@@ -639,7 +652,7 @@ fn make_visuals(dark: bool) -> egui::Visuals {
     v.window_fill = window;
     v.window_corner_radius = 0.into();
     v.window_stroke = Stroke::new(1.0, stroke);
-    v.window_shadow = egui::Shadow { offset: [0, 10], blur: 32, spread: 4, color: Color32::from_black_alpha(if dark { 220 } else { 150 }) };
+    v.window_shadow = popup_shadow(dark);
     v.extreme_bg_color = if dark { Color32::from_rgb(15, 23, 42) } else { Color32::WHITE };
     for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
         w.corner_radius = 8.into();
@@ -690,7 +703,7 @@ impl eframe::App for DiaryApp {
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 720.0]).with_min_inner_size([800.0, 500.0]),
+        viewport: egui::ViewportBuilder::default().with_icon(std::sync::Arc::new(icon::app_icon())).with_inner_size([1150.0, 720.0]).with_min_inner_size([800.0, 500.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -701,4 +714,33 @@ fn main() -> eframe::Result {
             Ok(Box::new(DiaryApp::new()))
         }),
     )
+}
+
+fn popup_shadow(dark: bool) -> egui::Shadow {
+    egui::Shadow { offset: [0, 10], blur: 32, spread: 4, color: Color32::from_black_alpha(if dark { 220 } else { 150 }) }
+}
+
+/// Window frame for popups: same panel colour as the main window, square corners, dark shadow.
+fn popup_frame(p: &Palette, dark: bool) -> egui::Frame {
+    egui::Frame::new()
+        .fill(p.panel_bg)
+        .stroke(Stroke::new(1.0, p.cell_border))
+        .shadow(popup_shadow(dark))
+}
+
+/// Blue title band matching the main window's header. Returns true when the close button is clicked.
+fn popup_header(ui: &mut egui::Ui, p: &Palette, title: &str) -> bool {
+    let mut close = false;
+    egui::Frame::new().fill(p.header).inner_margin(egui::Margin::symmetric(14, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).size(22.0).strong().color(Color32::WHITE));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("✕").clicked() {
+                    close = true;
+                }
+            });
+        });
+    });
+    close
 }
