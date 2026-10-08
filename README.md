@@ -1,18 +1,22 @@
 # VibeDiary
 
-A simple personal diary / journal for Windows, written in Rust with [eframe/egui](https://github.com/emilk/egui).
+A simple, private diary / journal for Windows, written in Rust with [eframe/egui](https://github.com/emilk/egui).
 
-Write down your thoughts each day, tag them with colour-coded categories, and see at a glance which days have entries on a month calendar.
+Write down your thoughts each day with rich formatting and pictures, tag them with colour-coded categories, and see at a glance which days have entries on a month calendar. Everything is encrypted with a password.
 
 ## Features
 
 - **Month calendar** with each day's entries shown as coloured pills (time + first line of the entry).
-- **Multiple entries per day**, each recorded with the time it was added.
+- **Multiple entries per day**, each with a time. You can change an entry's date and time when you edit it.
+- **Rich text editor** (Markdown-based) with a formatting toolbar and a live preview: bold, italic, strikethrough, code, three heading sizes, bulleted and numbered lists and quotes. `Ctrl+B` and `Ctrl+I` work too.
+- **Pictures**: add images with the **Image** button or by dropping a file onto the editor. Large images are shrunk (longest side 1600 px) and stored inside the encrypted diary.
 - **Categories** with their own colours. Add, rename, recolour and delete them from the Categories window. Renaming a category updates the entries that use it.
-- **Popup windows** for creating and editing entries and for managing categories; both are resizable.
+- **Search** across all entries from the box in the header; click a result to jump to its day.
+- **Password protection.** The diary is encrypted with a password you choose, and the app asks for it every time it starts. **Lock** locks it immediately; **Menu → Change password** changes it.
+- **Auto-lock** after a period of inactivity (default 10 minutes; change or turn off under **Menu → Auto-lock**). An entry you're in the middle of writing survives locking.
+- **Backup**: **Menu → Back up encrypted copy** saves a copy of the encrypted file wherever you like.
+- **Popup windows** for creating and editing entries and for managing categories; they are draggable and resizable.
 - **Light and dark mode** that follow your Windows system setting.
-- **Password protection.** The diary is encrypted with a password you choose, and the app asks for it every time it starts. There is a **Lock** button to lock it again and a **Password** button to change it.
-- **Day panel** on the right listing the selected day's entries, with Edit and Delete for each.
 
 ## Using the app
 
@@ -21,10 +25,15 @@ Write down your thoughts each day, tag them with colour-coded categories, and se
 | Select a day | Click it on the calendar |
 | New entry | Double-click a day, or use **New entry** / **Add entry for this day** |
 | Edit or delete an entry | Use the buttons on its card in the day panel |
+| Format text | Select text and use the toolbar buttons (click again to remove the format) |
+| Add a picture | **Image…** in the editor, or drop an image file onto the editor |
 | Change month | **◀** / **▶** in the header, or **Today** to jump back |
+| Search | Type in the search box; clear it to go back to the day view |
 | Manage categories | **Categories** button in the header (press Enter to apply a rename) |
 
 Deleting a category does not delete its entries; they are shown in grey.
+
+Entries are stored as Markdown, so you can also type the syntax yourself (`**bold**`, `# Heading`, `- list`, `> quote`, `` `code` ``).
 
 ## Running it
 
@@ -34,21 +43,22 @@ You need the [Rust toolchain](https://rustup.rs/). From the project folder:
 cargo run
 ```
 
-Use `cargo run --release` for an optimised build.
+Use `cargo run --release` for an optimised build. The build embeds the app icon in the `.exe`, which needs the Windows SDK's resource compiler (installed with the Visual Studio C++ build tools). If it is missing, the build still succeeds with a warning and the file just keeps the default icon.
 
 ## Where your data is stored
 
-Entries and categories are saved, encrypted, to `entries.json` in the project folder (the folder is fixed when the app is built, so it doesn't depend on where you launch it from). The file is listed in `.gitignore`, so your diary is not committed to git.
+Entries, categories, images and settings are saved, encrypted, to `entries.json` in the project folder (the folder is fixed when the app is built, so it doesn't depend on where you launch it from). The file is listed in `.gitignore`, so your diary is not committed to git.
 
 ## Encryption
 
 - Your password is stretched into a key with **Argon2id** (64 MiB, 3 passes), and the diary is sealed with **XChaCha20-Poly1305**, which also detects a wrong password or a damaged or tampered file.
-- `entries.json` is a small JSON envelope holding the key-derivation settings, a random salt and nonce, and the ciphertext. Nothing in it reveals your entries.
+- `entries.json` is a small JSON envelope holding the key-derivation settings, a random salt and nonce, and the ciphertext. Nothing in it reveals your entries or pictures.
 - Every save uses a fresh nonce, is checked by decrypting it again, and replaces the old file atomically.
 - **There is no password recovery.** If you forget the password, the diary can't be read.
 - Passwords must be at least 8 characters.
 - An unencrypted `entries.json` from an earlier version is offered for encryption the first time you run the app. It is replaced by the encrypted version and no plain-text backup is kept.
-- Text held in memory while the app is unlocked is not protected. Use **Lock** if you step away.
+- Text and pictures held in memory while the app is unlocked are not protected. Use **Lock** if you step away.
+- Because pictures are inside the file, a diary with many large pictures makes every save slower and the file bigger.
 
 Once decrypted, the data looks like this:
 
@@ -63,15 +73,18 @@ Once decrypted, the data looks like this:
       "date": "2026-10-08",
       "added_at": "2026-10-08 16:11:27",
       "category": "Personal",
-      "text": "Your thoughts for the day"
+      "text": "# A good day\n\nSome **bold** thoughts.\n\n![photo](img:i1760000000000)"
     }
-  ]
+  ],
+  "images": { "i1760000000000": "<base64 JPEG or PNG>" },
+  "settings": { "auto_lock_minutes": 10 }
 }
 ```
 
 ## Project layout
 
-- `src/main.rs` contains the application: the UI, lock screen and file handling.
+- `src/main.rs` contains the application: the UI, lock screen, editor and file handling.
+- `src/markdown.rs` parses and renders entries and holds the toolbar's text-formatting logic.
 - `src/vault.rs` contains the password-based encryption.
-- `src/icon.rs` draws the app icon.
-- `Cargo.toml` lists the dependencies: `eframe`, `chrono`, `serde`, `serde_json`, `argon2`, `chacha20poly1305`, `base64` and `getrandom`.
+- `src/icon.rs` draws the app icon; `build.rs` turns it into the `.exe` icon.
+- `Cargo.toml` lists the dependencies: `eframe`/`egui_extras` (UI), `chrono`/`jiff` (dates), `serde`/`serde_json`, `pulldown-cmark` (Markdown), `image` (pictures), `rfd` (file dialogs), `argon2`/`chacha20poly1305`/`base64`/`getrandom` (encryption), and `winresource` (build only).

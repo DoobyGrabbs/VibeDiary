@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate, Timelike};
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke, vec2};
 use serde::{Deserialize, Serialize};
 
 mod icon;
+mod markdown;
 mod vault;
 
 const BLUE: Color32 = Color32::from_rgb(37, 99, 235);
@@ -94,6 +95,23 @@ struct Entry {
 struct Data {
     categories: Vec<Category>,
     entries: Vec<Entry>,
+    /// Images used by entries: id -> base64 of the (re-encoded) image file.
+    #[serde(default)]
+    images: BTreeMap<String, String>,
+    #[serde(default)]
+    settings: Settings,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Settings {
+    /// Lock after this many idle minutes; 0 turns auto-lock off.
+    auto_lock_minutes: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { auto_lock_minutes: 10 }
+    }
 }
 
 fn default_categories() -> Vec<Category> {
@@ -115,7 +133,7 @@ fn data_path() -> PathBuf {
 }
 
 fn fresh_data() -> Data {
-    Data { categories: default_categories(), entries: Vec::new() }
+    Data { categories: default_categories(), entries: Vec::new(), images: BTreeMap::new(), settings: Settings::default() }
 }
 
 /// What is currently on disk.
@@ -191,14 +209,15 @@ fn text_on(bg: Color32) -> Color32 {
     if lum > 150.0 { Color32::from_rgb(30, 41, 59) } else { Color32::WHITE }
 }
 
-fn first_line(s: &str) -> &str {
-    s.lines().next().unwrap_or("")
-}
 
 struct EditState {
     /// `Some` when editing an existing entry.
     id: Option<u64>,
     date: NaiveDate,
+    hour: u32,
+    minute: u32,
+    /// Seconds are kept from the original timestamp so entries stay in order.
+    second: u32,
     category: String,
     text: String,
 }
@@ -262,6 +281,14 @@ struct DiaryApp {
     pw_confirm: String,
     pw_error: String,
     status: String,
+    media: markdown::Media,
+    show_preview: bool,
+    search: String,
+    last_activity: std::time::Instant,
+    /// Images used by an unsaved draft, kept while the diary is locked.
+    draft_images: BTreeMap<String, String>,
+    /// Message shown in the entry editor (e.g. an image that failed to load).
+    editor_msg: String,
 }
 
 impl DiaryApp {
@@ -289,10 +316,17 @@ impl DiaryApp {
             pw_confirm: String::new(),
             pw_error: String::new(),
             status: String::new(),
+            media: markdown::Media::default(),
+            show_preview: true,
+            search: String::new(),
+            last_activity: std::time::Instant::now(),
+            draft_images: BTreeMap::new(),
+            editor_msg: String::new(),
         }
     }
 
     fn persist(&mut self) {
+        self.drop_unused_images();
         self.status = match &self.vault {
             Some(v) => match save(&self.data, v) {
                 Ok(()) => "Saved".into(),
@@ -300,6 +334,18 @@ impl DiaryApp {
             },
             None => "Save failed: the diary is locked".into(),
         };
+    }
+
+    /// Remove stored images that no entry (or open draft) refers to any more.
+    fn drop_unused_images(&mut self) {
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for e in &self.data.entries {
+            used.extend(markdown::image_ids(&e.text));
+        }
+        if let Some(ed) = &self.editor {
+            used.extend(markdown::image_ids(&ed.text));
+        }
+        self.data.images.retain(|id, _| used.contains(id));
     }
 
     /// Try to unlock / create / encrypt using what was typed on the lock screen.
@@ -319,6 +365,8 @@ impl DiaryApp {
             Ok((v, data)) => {
                 self.vault = Some(v);
                 self.data = data;
+                self.data.images.extend(std::mem::take(&mut self.draft_images));
+                self.last_activity = std::time::Instant::now();
                 self.lock = None;
                 self.status.clear();
             }
@@ -337,9 +385,18 @@ impl DiaryApp {
             Disk::Encrypted(env) => LockMode::Unlock(env),
             _ => LockMode::Broken("the diary file changed unexpectedly".into()),
         };
+        // An open draft survives locking (it only exists in memory), along with its images.
+        self.draft_images = match &self.editor {
+            Some(ed) => markdown::image_ids(&ed.text)
+                .into_iter()
+                .filter_map(|id| self.data.images.get(&id).map(|b| (id, b.clone())))
+                .collect(),
+            None => BTreeMap::new(),
+        };
         self.data = fresh_data();
         self.vault = None;
-        self.editor = None;
+        self.media = markdown::Media::default();
+        self.search.clear();
         self.show_categories = false;
         self.show_password = false;
         self.lock = Some(Lock::new(mode));
@@ -486,10 +543,20 @@ impl DiaryApp {
 
     fn new_entry(&mut self, date: NaiveDate) {
         let category = self.data.categories.first().map(|c| c.name.clone()).unwrap_or_default();
-        self.editor = Some(EditState { id: None, date, category, text: String::new() });
+        let now = Local::now();
+        self.editor = Some(EditState {
+            id: None,
+            date,
+            hour: now.hour(),
+            minute: now.minute(),
+            second: now.second(),
+            category,
+            text: String::new(),
+        });
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui.ctx());
         ui.horizontal_centered(|ui| {
             ui.label(RichText::new("My Diary").size(24.0).strong().color(Color32::WHITE));
             ui.add_space(24.0);
@@ -505,13 +572,38 @@ impl DiaryApp {
                 let t = Local::now().date_naive();
                 self.selected = t;
                 self.month = t.with_day(1).unwrap();
+                self.search.clear();
             }
+            ui.add_space(8.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Search entries")
+                    .text_color(p.ink)
+                    .margin(egui::Margin::symmetric(8, 5))
+                    .desired_width(190.0),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Lock").clicked() {
                     self.lock_now();
                 }
-                if ui.button("Password").clicked() {
-                    self.show_password = true;
+                let mut settings_changed = false;
+                ui.menu_button("Menu", |ui| {
+                    if ui.button("Change password…").clicked() {
+                        self.show_password = true;
+                        ui.close();
+                    }
+                    if ui.button("Back up encrypted copy…").clicked() {
+                        self.backup();
+                        ui.close();
+                    }
+                    ui.menu_button("Auto-lock", |ui| {
+                        for (label, mins) in [("Off", 0), ("After 1 minute", 1), ("After 5 minutes", 5), ("After 10 minutes", 10), ("After 30 minutes", 30)] {
+                            settings_changed |= ui.radio_value(&mut self.data.settings.auto_lock_minutes, mins, label).changed();
+                        }
+                    });
+                });
+                if settings_changed {
+                    self.persist();
                 }
                 if ui.button("🎨 Categories").clicked() {
                     self.show_categories = true;
@@ -521,6 +613,18 @@ impl DiaryApp {
                 }
             });
         });
+    }
+
+    /// Copy the (already encrypted) diary file somewhere chosen by the user.
+    fn backup(&mut self) {
+        let name = format!("diary-backup-{}.json", Local::now().format("%Y-%m-%d"));
+        let dest = rfd::FileDialog::new().set_file_name(name).add_filter("Encrypted diary", &["json"]).save_file();
+        if let Some(dest) = dest {
+            self.status = match std::fs::copy(data_path(), &dest) {
+                Ok(_) => format!("Backup saved to {}", dest.display()),
+                Err(e) => format!("Save failed: backup could not be written ({e})"),
+            };
+        }
     }
 
     fn calendar(&mut self, ui: &mut egui::Ui) {
@@ -597,7 +701,7 @@ impl DiaryApp {
                 painter.with_clip_rect(pr.shrink2(vec2(4.0, 0.0))).text(
                     egui::pos2(pr.min.x + 7.0, pr.center().y),
                     Align2::LEFT_CENTER,
-                    format!("{} {}", &e.added_at[11..16.min(e.added_at.len())], first_line(&e.text)),
+                    format!("{} {}", e.added_at.get(11..16).unwrap_or(""), markdown::summary(&e.text)),
                     FontId::proportional(14.0),
                     text_on(c),
                 );
@@ -634,6 +738,10 @@ impl DiaryApp {
 
     fn day_panel(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui.ctx());
+        if !self.search.trim().is_empty() {
+            self.search_results(ui, &p);
+            return;
+        }
         ui.label(RichText::new(self.selected.format("%A").to_string()).size(14.0).color(p.muted));
         ui.label(RichText::new(self.selected.format("%e %B %Y").to_string()).size(22.0).strong().color(p.title));
         ui.add_space(6.0);
@@ -643,11 +751,15 @@ impl DiaryApp {
         if self.status.starts_with("Save failed") {
             ui.add_space(4.0);
             ui.label(RichText::new(&self.status).color(Color32::from_rgb(239, 68, 68)));
+        } else if !self.status.is_empty() && self.status != "Saved" {
+            ui.add_space(4.0);
+            ui.label(RichText::new(&self.status).small().color(p.muted));
         }
         ui.add_space(8.0);
         ui.separator();
 
         let entries: Vec<Entry> = self.day_entries(self.selected).into_iter().cloned().collect();
+        let body = ui.style().text_styles[&egui::TextStyle::Body].size;
         let mut edit = None;
         let mut delete = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -656,7 +768,7 @@ impl DiaryApp {
                 ui.label("No entries for this day yet.");
             }
             for e in &entries {
-                let c = self.cat_color(&e.category);
+                let c = category_color(&self.data.categories, &e.category);
                 let fg = text_on(c);
                 egui::Frame::new()
                     .fill(c)
@@ -668,10 +780,13 @@ impl DiaryApp {
                             ui.label(RichText::new(&e.category).strong().color(fg));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let time = e.added_at.get(11..16).unwrap_or("");
-                                ui.label(RichText::new(format!("Added {time}")).small().color(fg));
+                                ui.label(RichText::new(time).small().color(fg));
                             });
                         });
-                        ui.add(egui::Label::new(RichText::new(&e.text).color(fg)).wrap());
+                        ui.add_space(4.0);
+                        let style = markdown::Style { text: fg, link: fg, size: body };
+                        markdown::render(ui, &e.text, &style, &mut self.media, &self.data.images);
+                        ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             if ui.button("Edit").clicked() {
                                 edit = Some(e.id);
@@ -687,12 +802,19 @@ impl DiaryApp {
 
         if let Some(id) = edit {
             if let Some(e) = self.data.entries.iter().find(|e| e.id == id) {
+                let date = NaiveDate::parse_from_str(&e.date, "%Y-%m-%d").unwrap_or(self.selected);
+                let time = chrono::NaiveTime::parse_from_str(e.added_at.get(11..).unwrap_or(""), "%H:%M:%S")
+                    .unwrap_or_default();
                 self.editor = Some(EditState {
                     id: Some(id),
-                    date: self.selected,
+                    date,
+                    hour: time.hour(),
+                    minute: time.minute(),
+                    second: time.second(),
                     category: e.category.clone(),
                     text: e.text.clone(),
                 });
+                self.editor_msg.clear();
             }
         }
         if let Some(id) = delete {
@@ -701,20 +823,88 @@ impl DiaryApp {
         }
     }
 
+    /// Replaces the day panel while something is typed in the search box.
+    fn search_results(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let q = self.search.trim().to_lowercase();
+        let mut hits: Vec<&Entry> = self
+            .data
+            .entries
+            .iter()
+            .filter(|e| e.text.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q) || e.date.contains(&q))
+            .collect();
+        hits.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+
+        ui.label(RichText::new("Search results").size(22.0).strong().color(p.title));
+        ui.label(RichText::new(format!("{} found. Click one to open its day.", hits.len())).color(p.muted));
+        ui.add_space(6.0);
+        ui.separator();
+
+        let mut jump = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for e in hits.iter().take(100) {
+                let c = category_color(&self.data.categories, &e.category);
+                let fg = text_on(c);
+                let card = egui::Frame::new().fill(c).corner_radius(10).inner_margin(10).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&e.date).strong().color(fg));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(&e.category).small().color(fg));
+                        });
+                    });
+                    let mut s = markdown::summary(&e.text);
+                    if s.chars().count() > 110 {
+                        s = s.chars().take(110).collect::<String>() + "…";
+                    }
+                    ui.label(RichText::new(s).color(fg));
+                });
+                let resp = ui.interact(card.response.rect, ui.id().with(("hit", e.id)), Sense::click());
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    jump = NaiveDate::parse_from_str(&e.date, "%Y-%m-%d").ok();
+                }
+                ui.add_space(6.0);
+            }
+        });
+        if let Some(d) = jump {
+            self.selected = d;
+            self.month = d.with_day(1).unwrap();
+            self.search.clear();
+        }
+    }
+
     fn entry_window(&mut self, ctx: &egui::Context) {
+        if self.editor.is_none() {
+            return;
+        }
         let p = palette(ctx);
-        let Some(ed) = &mut self.editor else { return };
-        let cats = &self.data.categories;
         let dark = ctx.theme() == egui::Theme::Dark;
+        let text_id = egui::Id::new("entry_text");
+        let DiaryApp { editor, data, media, show_preview, editor_msg, .. } = self;
+        let ed = editor.as_mut().unwrap();
         let mut save_it = false;
         let mut cancel = false;
+
+        // Keyboard shortcuts for the common formats.
+        let shortcuts = [(egui::Key::B, markdown::Format::Bold), (egui::Key::I, markdown::Format::Italic)];
+        for (key, format) in shortcuts {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, key)) {
+                format_selection(ctx, text_id, &mut ed.text, format);
+            }
+        }
+        // Images dropped onto the window.
+        for file in ctx.input(|i| i.raw.dropped_files.clone()) {
+            match import_image(data, file.path()) {
+                Ok(md) => insert_at_cursor(ctx, text_id, &mut ed.text, &md),
+                Err(e) => *editor_msg = e,
+            }
+        }
 
         egui::Window::new(if ed.id.is_some() { "Edit entry" } else { "New entry" })
             .title_bar(false)
             .frame(popup_frame(&p, dark))
             .resizable(true)
-            .default_size([480.0, 380.0])
-            .min_size([320.0, 240.0])
+            .default_size([940.0, 620.0])
+            .min_size([560.0, 380.0])
             .pivot(Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
@@ -722,73 +912,159 @@ impl DiaryApp {
                     cancel = true;
                 }
                 egui::Frame::new().inner_margin(14).show(ui, |ui| {
-                ui.label(RichText::new(ed.date.format("%A, %e %B %Y").to_string()).strong());
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("Category:");
-                    let sel_color = rgb(cats.iter().find(|c| c.name == ed.category).map_or(GREY, |c| c.color));
-                    egui::ComboBox::from_id_salt("cat")
-                        .selected_text(RichText::new(&ed.category).strong().color(text_on(sel_color)).background_color(sel_color))
-                        .show_ui(ui, |ui| {
-                            for c in cats {
-                                let col = rgb(c.color);
-                                ui.selectable_value(
-                                    &mut ed.category,
-                                    c.name.clone(),
-                                    RichText::new(&c.name).strong().color(text_on(col)).background_color(col),
-                                );
+                    // Day, time and category.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Date:");
+                        let mut picked = jiff::civil::date(ed.date.year() as i16, ed.date.month() as i8, ed.date.day() as i8);
+                        ui.add(egui_extras::DatePickerButton::new(&mut picked).id_salt("entry_date").show_icon(false));
+                        if let Some(d) = NaiveDate::from_ymd_opt(picked.year() as i32, picked.month() as u32, picked.day() as u32) {
+                            ed.date = d;
+                        }
+                        ui.label(RichText::new(ed.date.format("%A").to_string()).color(p.muted));
+                        ui.add_space(10.0);
+                        ui.label("Time:");
+                        let two = |n: f64, _: std::ops::RangeInclusive<usize>| format!("{:02}", n as u32);
+                        ui.add(egui::DragValue::new(&mut ed.hour).range(0..=23).custom_formatter(two));
+                        ui.label(":");
+                        ui.add(egui::DragValue::new(&mut ed.minute).range(0..=59).custom_formatter(two));
+                        ui.add_space(10.0);
+                        ui.label("Category:");
+                        let cats = &data.categories;
+                        let sel_color = category_color(cats, &ed.category);
+                        egui::ComboBox::from_id_salt("cat")
+                            .selected_text(RichText::new(&ed.category).strong().color(text_on(sel_color)).background_color(sel_color))
+                            .show_ui(ui, |ui| {
+                                for c in cats {
+                                    let col = rgb(c.color);
+                                    ui.selectable_value(
+                                        &mut ed.category,
+                                        c.name.clone(),
+                                        RichText::new(&c.name).strong().color(text_on(col)).background_color(col),
+                                    );
+                                }
+                            });
+                    });
+                    ui.add_space(6.0);
+
+                    // Formatting toolbar.
+                    ui.horizontal_wrapped(|ui| {
+                        use markdown::Format::*;
+                        let buttons: [(RichText, &str, markdown::Format); 10] = [
+                            (RichText::new("B").strong().color(Color32::WHITE), "Bold (Ctrl+B)", Bold),
+                            (RichText::new("I").italics().color(Color32::WHITE), "Italic (Ctrl+I)", Italic),
+                            (RichText::new("S").strikethrough().color(Color32::WHITE), "Strikethrough", Strike),
+                            (RichText::new("Code").monospace().color(Color32::WHITE), "Code", Code),
+                            (RichText::new("H1").color(Color32::WHITE), "Large heading", Heading(1)),
+                            (RichText::new("H2").color(Color32::WHITE), "Medium heading", Heading(2)),
+                            (RichText::new("H3").color(Color32::WHITE), "Small heading", Heading(3)),
+                            (RichText::new("• List").color(Color32::WHITE), "Bulleted list", Bullet),
+                            (RichText::new("1. List").color(Color32::WHITE), "Numbered list", Numbered),
+                            (RichText::new("Quote").color(Color32::WHITE), "Quote", Quote),
+                        ];
+                        for (label, tip, format) in buttons {
+                            if ui.button(label).on_hover_text(tip).clicked() {
+                                format_selection(ctx, text_id, &mut ed.text, format);
                             }
+                        }
+                        ui.add_space(8.0);
+                        if ui.button("🖼 Image…").on_hover_text("Add a picture (or drop one onto this window)").clicked() {
+                            let picked = rfd::FileDialog::new()
+                                .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp", "webp"])
+                                .pick_file();
+                            if let Some(path) = picked {
+                                match import_image(data, &path) {
+                                    Ok(md) => {
+                                        insert_at_cursor(ctx, text_id, &mut ed.text, &md);
+                                        editor_msg.clear();
+                                    }
+                                    Err(e) => *editor_msg = e,
+                                }
+                            }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.checkbox(show_preview, "Live preview");
                         });
-                });
-                ui.add_space(6.0);
-                // Fill the window, leaving room for the buttons underneath.
-                let height = (ui.available_height() - 58.0).max(80.0);
-                ui.add_sized(
-                    [ui.available_width(), height],
-                    egui::TextEdit::multiline(&mut ed.text)
-                        .hint_text("What's on your mind?")
-                        .text_color(p.ink),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let can_save = !ed.text.trim().is_empty();
-                    if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
-                        save_it = true;
+                    });
+                    if !editor_msg.is_empty() {
+                        ui.label(RichText::new(editor_msg.as_str()).color(Color32::from_rgb(239, 68, 68)));
                     }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
+                    ui.add_space(6.0);
+
+                    // Editor (and preview).
+                    let height = (ui.available_height() - 52.0).max(120.0);
+                    let body = ui.style().text_styles[&egui::TextStyle::Body].size;
+                    let edit_pane = |ui: &mut egui::Ui, text: &mut String| {
+                        egui::ScrollArea::vertical().id_salt("edit_scroll").auto_shrink([false, false]).max_height(height).show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(text)
+                                    .id(text_id)
+                                    .hint_text("What's on your mind?")
+                                    .text_color(p.ink)
+                                    .desired_width(f32::INFINITY)
+                                    .min_size(vec2(0.0, height - 8.0)),
+                            );
+                        });
+                    };
+                    if *show_preview {
+                        ui.columns(2, |cols| {
+                            edit_pane(&mut cols[0], &mut ed.text);
+                            egui::Frame::new().fill(p.page_bg).inner_margin(10).show(&mut cols[1], |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("preview_scroll")
+                                    .auto_shrink([false, false])
+                                    .max_height(height - 20.0)
+                                    .show(ui, |ui| {
+                                        ui.set_min_height(height - 24.0);
+                                        let style = markdown::Style { text: p.ink, link: p.accent, size: body };
+                                        markdown::render(ui, &ed.text, &style, media, &data.images);
+                                    });
+                            });
+                        });
+                    } else {
+                        edit_pane(ui, &mut ed.text);
                     }
-                });
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!ed.text.trim().is_empty(), egui::Button::new("Save")).clicked() {
+                            save_it = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
                 });
             });
 
         if save_it {
             let ed = self.editor.take().unwrap();
             let text = ed.text.trim().to_string();
+            let added_at = format!("{} {:02}:{:02}:{:02}", key(ed.date), ed.hour, ed.minute, ed.second);
             match ed.id {
                 Some(id) => {
                     if let Some(e) = self.data.entries.iter_mut().find(|e| e.id == id) {
                         e.text = text;
                         e.category = ed.category;
+                        e.date = key(ed.date);
+                        e.added_at = added_at;
                     }
                 }
                 None => {
                     let id = self.data.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-                    self.data.entries.push(Entry {
-                        id,
-                        date: key(ed.date),
-                        added_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                        category: ed.category,
-                        text,
-                    });
+                    self.data.entries.push(Entry { id, date: key(ed.date), added_at, category: ed.category, text });
                 }
             }
             self.selected = ed.date;
+            self.month = ed.date.with_day(1).unwrap();
+            self.editor_msg.clear();
             self.persist();
         } else if cancel {
             self.editor = None;
+            self.editor_msg.clear();
+
         }
     }
+
 
     fn categories_window(&mut self, ctx: &egui::Context) {
         let p = palette(ctx);
@@ -939,7 +1215,29 @@ fn make_visuals(dark: bool) -> egui::Visuals {
     v
 }
 
+/// Use Segoe UI (with a real bold) when it is installed; otherwise fall back to egui's fonts.
+fn setup_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontFamily};
+    let mut fonts = egui::FontDefinitions::default();
+    let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:/Windows".into());
+    let read = |file: &str| std::fs::read(std::path::Path::new(&dir).join("Fonts").join(file)).ok();
+
+    if let Some(bytes) = read("segoeui.ttf") {
+        fonts.font_data.insert("segoe".into(), std::sync::Arc::new(FontData::from_owned(bytes)));
+        fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "segoe".into());
+    }
+    let mut bold = Vec::new();
+    if let Some(bytes) = read("segoeuib.ttf") {
+        fonts.font_data.insert("segoe-bold".into(), std::sync::Arc::new(FontData::from_owned(bytes)));
+        bold.push("segoe-bold".to_string());
+    }
+    bold.extend(fonts.families[&FontFamily::Proportional].clone());
+    fonts.families.insert(markdown::bold_family(), bold);
+    ctx.set_fonts(fonts);
+}
+
 fn setup_style(ctx: &egui::Context) {
+    setup_fonts(ctx);
     // Follow the system light/dark setting.
     ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::System);
     ctx.set_visuals_of(egui::Theme::Light, make_visuals(false));
@@ -956,6 +1254,22 @@ impl eframe::App for DiaryApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let p = palette(&ctx);
+        // Auto-lock after a period without any input.
+        if self.lock.is_none() {
+            if ctx.input(|i| !i.events.is_empty()) {
+                self.last_activity = std::time::Instant::now();
+            }
+            let minutes = self.data.settings.auto_lock_minutes;
+            if minutes > 0 {
+                let limit = std::time::Duration::from_secs(u64::from(minutes) * 60);
+                let idle = self.last_activity.elapsed();
+                if idle >= limit {
+                    self.lock_now();
+                } else {
+                    ctx.request_repaint_after(limit - idle + std::time::Duration::from_millis(250));
+                }
+            }
+        }
         if self.lock.is_some() {
             egui::Panel::top("header")
                 .frame(egui::Frame::new().fill(p.header).inner_margin(egui::Margin::symmetric(14, 10)))
@@ -986,7 +1300,7 @@ impl eframe::App for DiaryApp {
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_icon(std::sync::Arc::new(icon::app_icon())).with_inner_size([1150.0, 720.0]).with_min_inner_size([800.0, 500.0]),
+        viewport: egui::ViewportBuilder::default().with_icon(std::sync::Arc::new(egui::IconData { rgba: icon::rgba(256), width: 256, height: 256 })).with_inner_size([1150.0, 720.0]).with_min_inner_size([1000.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -1056,4 +1370,123 @@ fn password_field<'a>(text: &'a mut String, hint: &str, p: &Palette) -> egui::Te
 
 fn pressed_enter(r: &egui::Response, ui: &egui::Ui) -> bool {
     r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+}
+
+fn category_color(cats: &[Category], name: &str) -> Color32 {
+    rgb(cats.iter().find(|c| c.name == name).map_or(GREY, |c| c.color))
+}
+
+/// Apply a toolbar format to the current selection of the entry text box.
+fn format_selection(ctx: &egui::Context, id: egui::Id, text: &mut String, format: markdown::Format) {
+    use egui::text::{CCursor, CCursorRange};
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let end = text.chars().count();
+    let (a, b) = state
+        .cursor
+        .char_range()
+        .map_or((end, end), |r| (usize::from(r.primary.index), usize::from(r.secondary.index)));
+    let (s, e) = markdown::apply(text, (a.min(b), a.max(b)), format);
+    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(s), CCursor::new(e))));
+    state.store(ctx, id);
+    ctx.memory_mut(|m| m.request_focus(id));
+}
+
+/// Insert `md` on its own line(s) at the cursor of the entry text box.
+fn insert_at_cursor(ctx: &egui::Context, id: egui::Id, text: &mut String, md: &str) {
+    use egui::text::{CCursor, CCursorRange};
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let mut chars: Vec<char> = text.chars().collect();
+    let at = state.cursor.char_range().map_or(chars.len(), |r| usize::from(r.primary.index.max(r.secondary.index))).min(chars.len());
+    let lead = if at > 0 && chars[at - 1] != '\n' { "\n" } else { "" };
+    let insert: Vec<char> = format!("{lead}{md}\n").chars().collect();
+    let new_at = at + insert.len();
+    chars.splice(at..at, insert);
+    *text = chars.into_iter().collect();
+    state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(new_at))));
+    state.store(ctx, id);
+    ctx.memory_mut(|m| m.request_focus(id));
+}
+
+const MAX_IMAGE_SIDE: u32 = 1600;
+
+/// Read an image file, shrink it if it is large, store it in the diary data and return the
+/// Markdown that shows it.
+fn import_image(data: &mut Data, path: &std::path::Path) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = std::fs::read(path).map_err(|e| format!("Couldn't read {}: {e}", path.display()))?;
+    let mut img = image::load_from_memory(&bytes).map_err(|e| format!("Couldn't open that image: {e}"))?;
+    if img.width() > MAX_IMAGE_SIDE || img.height() > MAX_IMAGE_SIDE {
+        img = img.resize(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE, image::imageops::FilterType::Lanczos3);
+    }
+    // Keep transparency as PNG; photos and everything else as a compact JPEG.
+    let transparent = img.color().has_alpha() && img.to_rgba8().pixels().any(|p| p[3] < 255);
+    let mut out = Vec::new();
+    if transparent {
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    } else {
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+        img.to_rgb8().write_with_encoder(enc).map_err(|e| e.to_string())?;
+    }
+
+    let mut id = format!("i{}", chrono::Utc::now().timestamp_millis());
+    while data.images.contains_key(&id) {
+        id.push('x');
+    }
+    data.images.insert(id.clone(), base64::engine::general_purpose::STANDARD.encode(out));
+    let name = path.file_stem().map(|s| s.to_string_lossy().replace(['[', ']', '(', ')'], "")).unwrap_or_default();
+    Ok(format!("![{name}]({}{id})", markdown::IMAGE_SCHEME))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_png(path: &std::path::Path, alpha: u8) {
+        let img = image::RgbaImage::from_pixel(8, 6, image::Rgba([200, 30, 30, alpha]));
+        img.save(path).unwrap();
+    }
+
+    #[test]
+    fn imports_images_and_drops_unused_ones() {
+        let dir = std::env::temp_dir().join(format!("diary-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (opaque, clear) = (dir.join("my (photo).png"), dir.join("clear.png"));
+        tiny_png(&opaque, 255);
+        tiny_png(&clear, 100);
+
+        let mut data = fresh_data();
+        let md1 = import_image(&mut data, &opaque).unwrap();
+        let md2 = import_image(&mut data, &clear).unwrap();
+        assert!(md1.starts_with("![my photo](img:i"), "{md1}");
+        assert_eq!(data.images.len(), 2);
+        assert_eq!(markdown::image_ids(&md1).len(), 1);
+        assert!(import_image(&mut data, &dir.join("missing.png")).is_err());
+        assert!(md2.contains("img:"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn renders_rich_text_with_an_image_without_panicking() {
+        let dir = std::env::temp_dir().join(format!("diary-render-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tiny_png(&dir.join("a.png"), 255);
+        let mut data = fresh_data();
+        let img = import_image(&mut data, &dir.join("a.png")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let md = format!(
+            "# Title\n\nSome **bold**, *italic*, ~~gone~~ and `code`.\n\n- one\n- two\n\n1. a\n2. b\n\n> quoted\n\n{img}\n\n```\nlet x = 1;\n```\n\n---\n"
+        );
+        let ctx = egui::Context::default();
+        setup_style(&ctx);
+        let mut media = markdown::Media::default();
+        // The second frame is the first one that uses the fonts set up by `setup_style`.
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let style = markdown::Style { text: Color32::BLACK, link: Color32::BLUE, size: 16.0 };
+                markdown::render(ui, &md, &style, &mut media, &data.images);
+            });
+            out.textures_delta.clear();
+        }
+    }
 }
