@@ -8,8 +8,8 @@ use eframe::egui;
 type Entries = BTreeMap<String, String>;
 
 fn data_path() -> Option<PathBuf> {
-    // %APPDATA% on Windows (Roaming)
-    dirs::config_dir().map(|d| d.join("Diary").join("entries.json"))
+    // Project folder, fixed at compile time so it doesn't depend on the working directory.
+    Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("entries.json"))
 }
 
 fn load() -> Entries {
