@@ -6,6 +6,7 @@ use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke, vec2}
 use serde::{Deserialize, Serialize};
 
 mod icon;
+mod vault;
 
 const BLUE: Color32 = Color32::from_rgb(37, 99, 235);
 const BLUE_HOVER: Color32 = Color32::from_rgb(29, 78, 216);
@@ -89,7 +90,7 @@ struct Entry {
     text: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Data {
     categories: Vec<Category>,
     entries: Vec<Entry>,
@@ -113,15 +114,37 @@ fn data_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("entries.json")
 }
 
-fn load() -> Data {
-    let fresh = || Data { categories: default_categories(), entries: Vec::new() };
-    let Ok(raw) = std::fs::read_to_string(data_path()) else { return fresh() };
-    if let Ok(data) = serde_json::from_str::<Data>(&raw) {
-        return data;
+fn fresh_data() -> Data {
+    Data { categories: default_categories(), entries: Vec::new() }
+}
+
+/// What is currently on disk.
+enum Disk {
+    Missing,
+    Encrypted(vault::Envelope),
+    /// Unencrypted data written by an earlier version of the app.
+    Plain(Data),
+    Unreadable(String),
+}
+
+fn inspect() -> Disk {
+    let raw = match std::fs::read_to_string(data_path()) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Disk::Missing,
+        Err(e) => return Disk::Unreadable(e.to_string()),
+    };
+    if raw.trim().is_empty() {
+        return Disk::Missing;
     }
-    // Older format: one text per date, e.g. {"2026-10-08": "text"}.
+    if let Some(env) = vault::Envelope::parse(&raw) {
+        return Disk::Encrypted(env);
+    }
+    if let Ok(data) = serde_json::from_str::<Data>(&raw) {
+        return Disk::Plain(data);
+    }
+    // Oldest format: one text per date, e.g. {"2026-10-08": "text"}.
     if let Ok(old) = serde_json::from_str::<BTreeMap<String, String>>(&raw) {
-        let mut data = fresh();
+        let mut data = fresh_data();
         let category = data.categories[0].name.clone();
         data.entries = old
             .into_iter()
@@ -134,14 +157,24 @@ fn load() -> Data {
                 text,
             })
             .collect();
-        return data;
+        return Disk::Plain(data);
     }
-    fresh()
+    Disk::Unreadable("it is not a diary file this app recognises".into())
 }
 
-fn save(data: &Data) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
-    std::fs::write(data_path(), json).map_err(|e| e.to_string())
+/// Encrypt and write the diary. The result is decrypted again and checked before the old
+/// file is replaced, and the replacement is atomic, so a failure can't destroy your data.
+fn save(data: &Data, vault: &vault::Vault) -> Result<(), String> {
+    let json = serde_json::to_vec(data).map_err(|e| e.to_string())?;
+    let sealed = vault.seal(&json)?;
+    let env = vault::Envelope::parse(&sealed).ok_or("could not re-read the encrypted data")?;
+    if vault.open(&env)? != json {
+        return Err("encryption check failed".into());
+    }
+    let path = data_path();
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, sealed).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
 fn key(d: NaiveDate) -> String {
@@ -170,8 +203,51 @@ struct EditState {
     text: String,
 }
 
+#[derive(Clone)]
+enum LockMode {
+    /// No diary file yet: choose a password.
+    Create,
+    /// Encrypted diary: enter the password.
+    Unlock(vault::Envelope),
+    /// Unencrypted diary from an earlier version: choose a password to encrypt it.
+    Encrypt(Data),
+    /// The file exists but can't be used; never overwrite it.
+    Broken(String),
+}
+
+struct Lock {
+    mode: LockMode,
+    password: String,
+    confirm: String,
+    error: String,
+    focus: bool,
+}
+
+impl Lock {
+    fn new(mode: LockMode) -> Self {
+        Self { mode, password: String::new(), confirm: String::new(), error: String::new(), focus: true }
+    }
+}
+
+const MIN_PASSWORD: usize = 8;
+
+fn check_new_password(password: &str, confirm: &str) -> Result<(), String> {
+    if password.chars().count() < MIN_PASSWORD {
+        Err(format!("Use at least {MIN_PASSWORD} characters."))
+    } else if password != confirm {
+        Err("The two passwords don't match.".into())
+    } else {
+        Ok(())
+    }
+}
+
 struct DiaryApp {
+    /// Empty placeholder while the diary is locked.
     data: Data,
+    /// Present while unlocked; used to encrypt on every save.
+    vault: Option<vault::Vault>,
+    /// `Some` while the lock screen is showing.
+    lock: Option<Lock>,
     selected: NaiveDate,
     /// First day of the month being displayed.
     month: NaiveDate,
@@ -181,14 +257,26 @@ struct DiaryApp {
     new_cat_color: [u8; 3],
     /// Category row being renamed and its in-progress text.
     rename_buf: Option<(usize, String)>,
+    show_password: bool,
+    pw_new: String,
+    pw_confirm: String,
+    pw_error: String,
     status: String,
 }
 
 impl DiaryApp {
     fn new() -> Self {
         let today = Local::now().date_naive();
+        let mode = match inspect() {
+            Disk::Missing => LockMode::Create,
+            Disk::Encrypted(env) => LockMode::Unlock(env),
+            Disk::Plain(data) => LockMode::Encrypt(data),
+            Disk::Unreadable(why) => LockMode::Broken(why),
+        };
         Self {
-            data: load(),
+            data: fresh_data(),
+            vault: None,
+            lock: Some(Lock::new(mode)),
             selected: today,
             month: today.with_day(1).unwrap(),
             editor: None,
@@ -196,15 +284,188 @@ impl DiaryApp {
             new_cat_name: String::new(),
             new_cat_color: [59, 130, 246],
             rename_buf: None,
+            show_password: false,
+            pw_new: String::new(),
+            pw_confirm: String::new(),
+            pw_error: String::new(),
             status: String::new(),
         }
     }
 
     fn persist(&mut self) {
-        self.status = match save(&self.data) {
-            Ok(()) => "Saved".into(),
-            Err(e) => format!("Save failed: {e}"),
+        self.status = match &self.vault {
+            Some(v) => match save(&self.data, v) {
+                Ok(()) => "Saved".into(),
+                Err(e) => format!("Save failed: {e}"),
+            },
+            None => "Save failed: the diary is locked".into(),
         };
+    }
+
+    /// Try to unlock / create / encrypt using what was typed on the lock screen.
+    fn submit_lock(&mut self) {
+        let Some(lock) = self.lock.as_mut() else { return };
+        let password = lock.password.clone();
+        let result: Result<(vault::Vault, Data), String> = match lock.mode.clone() {
+            LockMode::Unlock(env) => vault::Vault::unlock(&env, &password).and_then(|(v, plain)| {
+                let data = serde_json::from_slice::<Data>(&plain).map_err(|e| e.to_string())?;
+                Ok((v, data))
+            }),
+            LockMode::Create => create_vault(&password, &lock.confirm, fresh_data()),
+            LockMode::Encrypt(data) => create_vault(&password, &lock.confirm, data),
+            LockMode::Broken(_) => return,
+        };
+        match result {
+            Ok((v, data)) => {
+                self.vault = Some(v);
+                self.data = data;
+                self.lock = None;
+                self.status.clear();
+            }
+            Err(e) => {
+                lock.error = e;
+                lock.password.clear();
+                lock.confirm.clear();
+                lock.focus = true;
+            }
+        }
+    }
+
+    /// Forget the key and the decrypted data and go back to the lock screen.
+    fn lock_now(&mut self) {
+        let mode = match inspect() {
+            Disk::Encrypted(env) => LockMode::Unlock(env),
+            _ => LockMode::Broken("the diary file changed unexpectedly".into()),
+        };
+        self.data = fresh_data();
+        self.vault = None;
+        self.editor = None;
+        self.show_categories = false;
+        self.show_password = false;
+        self.lock = Some(Lock::new(mode));
+    }
+
+    fn lock_screen(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui.ctx());
+        let dark = ui.ctx().theme() == egui::Theme::Dark;
+        let Some(lock) = self.lock.as_mut() else { return };
+        let (title, blurb, button) = match &lock.mode {
+            LockMode::Create => (
+                "Welcome to My Diary",
+                "Choose a password to protect your diary. It can't be recovered if you forget it.".to_string(),
+                "Create password",
+            ),
+            LockMode::Encrypt(_) => (
+                "Protect your diary",
+                "Your diary isn't encrypted yet. Choose a password to encrypt it. It can't be recovered if you forget it."
+                    .to_string(),
+                "Encrypt diary",
+            ),
+            LockMode::Unlock(_) => ("My Diary is locked", "Enter your password to open it.".to_string(), "Unlock"),
+            LockMode::Broken(why) => (
+                "Can't open the diary file",
+                format!("{}\n\nThe file was left untouched: {why}.\nFix or move it, then restart the app.", data_path().display()),
+                "",
+            ),
+        };
+        let needs_confirm = matches!(lock.mode, LockMode::Create | LockMode::Encrypt(_));
+        let broken = matches!(lock.mode, LockMode::Broken(_));
+        let mut submit = false;
+
+        ui.vertical_centered(|ui| {
+            ui.add_space(((ui.available_height() - 380.0) / 2.0).max(16.0));
+            egui::Frame::new()
+                .fill(p.panel_bg)
+                .stroke(Stroke::new(1.0, p.cell_border))
+                .shadow(popup_shadow(dark))
+                .inner_margin(28)
+                .show(ui, |ui| {
+                    ui.set_width(380.0);
+                    ui.label(RichText::new(title).size(28.0).strong().color(p.title));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(blurb).color(p.muted));
+                    ui.add_space(14.0);
+                    if broken {
+                        return;
+                    }
+
+                    let r = ui.add(password_field(&mut lock.password, "Password", &p));
+                    if lock.focus {
+                        r.request_focus();
+                        lock.focus = false;
+                    }
+                    submit |= pressed_enter(&r, ui) && !needs_confirm;
+                    if needs_confirm {
+                        ui.add_space(8.0);
+                        let r2 = ui.add(password_field(&mut lock.confirm, "Confirm password", &p));
+                        submit |= pressed_enter(&r2, ui);
+                    }
+                    ui.add_space(14.0);
+                    let btn = egui::Button::new(RichText::new(button).size(17.0)).min_size(vec2(ui.available_width(), 40.0));
+                    if ui.add(btn).clicked() {
+                        submit = true;
+                    }
+                    if !lock.error.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(&lock.error).color(Color32::from_rgb(239, 68, 68)));
+                    }
+                });
+        });
+        if submit {
+            self.submit_lock();
+        }
+    }
+
+    fn password_window(&mut self, ctx: &egui::Context) {
+        if !self.show_password {
+            return;
+        }
+        let p = palette(ctx);
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let mut close = false;
+        let mut apply = false;
+
+        egui::Window::new("Change password")
+            .title_bar(false)
+            .frame(popup_frame(&p, dark))
+            .resizable(false)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                close |= popup_header(ui, &p, "Change password");
+                egui::Frame::new().inner_margin(14).show(ui, |ui| {
+                    ui.set_width(340.0);
+                    ui.add(password_field(&mut self.pw_new, "New password", &p));
+                    ui.add_space(8.0);
+                    let r = ui.add(password_field(&mut self.pw_confirm, "Confirm new password", &p));
+                    apply |= pressed_enter(&r, ui);
+                    ui.add_space(10.0);
+                    if ui.button("Change password").clicked() {
+                        apply = true;
+                    }
+                    if !self.pw_error.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(&self.pw_error).color(Color32::from_rgb(239, 68, 68)));
+                    }
+                });
+            });
+
+        if apply {
+            match create_vault(&self.pw_new, &self.pw_confirm, self.data.clone()) {
+                Ok((v, _)) => {
+                    self.vault = Some(v);
+                    self.status = "Password changed".into();
+                    close = true;
+                }
+                Err(e) => self.pw_error = e,
+            }
+        }
+        if close {
+            self.show_password = false;
+            self.pw_new.clear();
+            self.pw_confirm.clear();
+            self.pw_error.clear();
+        }
     }
 
     fn cat_color(&self, name: &str) -> Color32 {
@@ -246,6 +507,12 @@ impl DiaryApp {
                 self.month = t.with_day(1).unwrap();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Lock").clicked() {
+                    self.lock_now();
+                }
+                if ui.button("Password").clicked() {
+                    self.show_password = true;
+                }
                 if ui.button("🎨 Categories").clicked() {
                     self.show_categories = true;
                 }
@@ -372,6 +639,10 @@ impl DiaryApp {
         ui.add_space(6.0);
         if ui.button("➕ Add entry for this day").clicked() {
             self.new_entry(self.selected);
+        }
+        if self.status.starts_with("Save failed") {
+            ui.add_space(4.0);
+            ui.label(RichText::new(&self.status).color(Color32::from_rgb(239, 68, 68)));
         }
         ui.add_space(8.0);
         ui.separator();
@@ -685,6 +956,17 @@ impl eframe::App for DiaryApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let p = palette(&ctx);
+        if self.lock.is_some() {
+            egui::Panel::top("header")
+                .frame(egui::Frame::new().fill(p.header).inner_margin(egui::Margin::symmetric(14, 10)))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("My Diary").size(24.0).strong().color(Color32::WHITE));
+                });
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(p.page_bg))
+                .show(ui, |ui| self.lock_screen(ui));
+            return;
+        }
         egui::Panel::top("header")
             .frame(egui::Frame::new().fill(p.header).inner_margin(egui::Margin::symmetric(14, 10)))
             .show(ui, |ui| self.header(ui));
@@ -698,6 +980,7 @@ impl eframe::App for DiaryApp {
 
         self.entry_window(&ctx);
         self.categories_window(&ctx);
+        self.password_window(&ctx);
     }
 }
 
@@ -736,11 +1019,41 @@ fn popup_header(ui: &mut egui::Ui, p: &Palette, title: &str) -> bool {
         ui.horizontal(|ui| {
             ui.label(RichText::new(title).size(22.0).strong().color(Color32::WHITE));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕").clicked() {
+                // Painted cross: the "✕" glyph isn't in egui's default font and shows up as a box.
+                let (rect, resp) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+                let fill = if resp.hovered() { RED } else { BLUE };
+                ui.painter().rect_filled(rect, 8.0, fill);
+                let s = Stroke::new(2.5, Color32::WHITE);
+                let r = rect.shrink(11.0);
+                ui.painter().line_segment([r.left_top(), r.right_bottom()], s);
+                ui.painter().line_segment([r.left_bottom(), r.right_top()], s);
+                if resp.on_hover_text("Close").clicked() {
                     close = true;
                 }
             });
         });
     });
     close
+}
+
+/// Derive a key for a new password, write the encrypted file, and return the unlocked vault.
+fn create_vault(password: &str, confirm: &str, data: Data) -> Result<(vault::Vault, Data), String> {
+    check_new_password(password, confirm)?;
+    let v = vault::Vault::create(password)?;
+    save(&data, &v)?;
+    Ok((v, data))
+}
+
+fn password_field<'a>(text: &'a mut String, hint: &str, p: &Palette) -> egui::TextEdit<'a> {
+    egui::TextEdit::singleline(text)
+        .password(true)
+        .hint_text(hint)
+        .font(FontId::proportional(18.0))
+        .margin(egui::Margin::symmetric(12, 8))
+        .text_color(p.ink)
+        .desired_width(f32::INFINITY)
+}
+
+fn pressed_enter(r: &egui::Response, ui: &egui::Ui) -> bool {
+    r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
 }

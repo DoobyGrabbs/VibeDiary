@@ -4,7 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+argon2 = "0.6.0"
+base64 = "0.23.1"
+chacha20poly1305 = "0.11.0"
 chrono = "0.4.45"
 eframe = "0.36.2"
+getrandom = "0.4.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+
+# Key derivation (Argon2) is far too slow unoptimised, so optimise dependencies in dev builds.
+[profile.dev.package."*"]
+opt-level = 3
