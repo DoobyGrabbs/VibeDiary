@@ -2,72 +2,156 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{Datelike, Local, NaiveDate};
-use eframe::egui;
+use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke, vec2};
+use serde::{Deserialize, Serialize};
 
-/// Entries keyed by ISO date (YYYY-MM-DD), one entry per day.
-type Entries = BTreeMap<String, String>;
+const BLUE: Color32 = Color32::from_rgb(37, 99, 235);
+const BLUE_HOVER: Color32 = Color32::from_rgb(29, 78, 216);
+const RED: Color32 = Color32::from_rgb(220, 38, 38);
+const PAGE_BG: Color32 = Color32::from_rgb(240, 247, 255);
+const GREY: [u8; 3] = [156, 163, 175];
 
-fn data_path() -> Option<PathBuf> {
+#[derive(Serialize, Deserialize, Clone)]
+struct Category {
+    name: String,
+    color: [u8; 3],
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Entry {
+    id: u64,
+    /// The diary day the entry belongs to, YYYY-MM-DD.
+    date: String,
+    /// When the entry was first written, YYYY-MM-DD HH:MM:SS (local time).
+    added_at: String,
+    category: String,
+    text: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Data {
+    categories: Vec<Category>,
+    entries: Vec<Entry>,
+}
+
+fn default_categories() -> Vec<Category> {
+    [
+        ("Personal", [96, 165, 250]),
+        ("Work", [251, 191, 36]),
+        ("Health", [74, 222, 128]),
+        ("Ideas", [192, 132, 252]),
+        ("Important", [248, 113, 113]),
+    ]
+    .into_iter()
+    .map(|(n, c)| Category { name: n.into(), color: c })
+    .collect()
+}
+
+fn data_path() -> PathBuf {
     // Project folder, fixed at compile time so it doesn't depend on the working directory.
-    Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("entries.json"))
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("entries.json")
 }
 
-fn load() -> Entries {
-    data_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn save(entries: &Entries) -> Result<(), String> {
-    let path = data_path().ok_or("no AppData folder")?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+fn load() -> Data {
+    let fresh = || Data { categories: default_categories(), entries: Vec::new() };
+    let Ok(raw) = std::fs::read_to_string(data_path()) else { return fresh() };
+    if let Ok(data) = serde_json::from_str::<Data>(&raw) {
+        return data;
     }
-    let json = serde_json::to_string_pretty(entries).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())
+    // Older format: one text per date, e.g. {"2026-10-08": "text"}.
+    if let Ok(old) = serde_json::from_str::<BTreeMap<String, String>>(&raw) {
+        let mut data = fresh();
+        let category = data.categories[0].name.clone();
+        data.entries = old
+            .into_iter()
+            .enumerate()
+            .map(|(i, (date, text))| Entry {
+                id: i as u64 + 1,
+                added_at: format!("{date} 00:00:00"),
+                date,
+                category: category.clone(),
+                text,
+            })
+            .collect();
+        return data;
+    }
+    fresh()
+}
+
+fn save(data: &Data) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
+    std::fs::write(data_path(), json).map_err(|e| e.to_string())
 }
 
 fn key(d: NaiveDate) -> String {
     d.format("%Y-%m-%d").to_string()
 }
 
+fn rgb(c: [u8; 3]) -> Color32 {
+    Color32::from_rgb(c[0], c[1], c[2])
+}
+
+/// Readable text colour for a given background.
+fn text_on(bg: Color32) -> Color32 {
+    let lum = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
+    if lum > 150.0 { Color32::from_rgb(30, 41, 59) } else { Color32::WHITE }
+}
+
+fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or("")
+}
+
+struct EditState {
+    /// `Some` when editing an existing entry.
+    id: Option<u64>,
+    date: NaiveDate,
+    category: String,
+    text: String,
+}
+
 struct DiaryApp {
-    entries: Entries,
+    data: Data,
     selected: NaiveDate,
     /// First day of the month being displayed.
     month: NaiveDate,
-    draft: String,
-    editing: bool,
+    editor: Option<EditState>,
+    show_categories: bool,
+    new_cat_name: String,
+    new_cat_color: [u8; 3],
     status: String,
 }
 
 impl DiaryApp {
     fn new() -> Self {
         let today = Local::now().date_naive();
-        let mut app = Self {
-            entries: load(),
+        Self {
+            data: load(),
             selected: today,
             month: today.with_day(1).unwrap(),
-            draft: String::new(),
-            editing: false,
+            editor: None,
+            show_categories: false,
+            new_cat_name: String::new(),
+            new_cat_color: [59, 130, 246],
             status: String::new(),
-        };
-        app.select(today);
-        app
-    }
-
-    fn select(&mut self, d: NaiveDate) {
-        self.selected = d;
-        self.draft = self.entries.get(&key(d)).cloned().unwrap_or_default();
-        self.editing = !self.entries.contains_key(&key(d));
+        }
     }
 
     fn persist(&mut self) {
-        self.status = match save(&self.entries) {
+        self.status = match save(&self.data) {
             Ok(()) => "Saved".into(),
             Err(e) => format!("Save failed: {e}"),
         };
+    }
+
+    fn cat_color(&self, name: &str) -> Color32 {
+        rgb(self.data.categories.iter().find(|c| c.name == name).map_or(GREY, |c| c.color))
+    }
+
+    fn day_entries(&self, d: NaiveDate) -> Vec<&Entry> {
+        let k = key(d);
+        let mut v: Vec<&Entry> = self.data.entries.iter().filter(|e| e.date == k).collect();
+        v.sort_by(|a, b| a.added_at.cmp(&b.added_at));
+        v
     }
 
     fn shift_month(&mut self, delta: i32) {
@@ -75,123 +159,395 @@ impl DiaryApp {
         self.month = NaiveDate::from_ymd_opt(total.div_euclid(12), total.rem_euclid(12) as u32 + 1, 1).unwrap();
     }
 
-    fn calendar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button("<").clicked() {
+    fn new_entry(&mut self, date: NaiveDate) {
+        let category = self.data.categories.first().map(|c| c.name.clone()).unwrap_or_default();
+        self.editor = Some(EditState { id: None, date, category, text: String::new() });
+    }
+
+    fn header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_centered(|ui| {
+            ui.label(RichText::new("My Diary").size(24.0).strong().color(Color32::WHITE));
+            ui.add_space(24.0);
+            let white = |s: &str| RichText::new(s).size(18.0).strong().color(Color32::WHITE);
+            if ui.button("◀").clicked() {
                 self.shift_month(-1);
             }
-            ui.strong(self.month.format("%B %Y").to_string());
-            if ui.button(">").clicked() {
+            ui.label(white(&self.month.format("%B %Y").to_string()));
+            if ui.button("▶").clicked() {
                 self.shift_month(1);
             }
+            if ui.button("Today").clicked() {
+                let t = Local::now().date_naive();
+                self.selected = t;
+                self.month = t.with_day(1).unwrap();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("🎨 Categories").clicked() {
+                    self.show_categories = true;
+                }
+                if ui.button("➕ New entry").clicked() {
+                    self.new_entry(self.selected);
+                }
+            });
         });
-        ui.add_space(6.0);
+    }
 
+    fn calendar(&mut self, ui: &mut egui::Ui) {
+        let first = self.month;
+        let next = self.shift_target(first);
+        let days = (next - first).num_days() as u32;
+        let offset = first.weekday().num_days_from_monday();
+        let rows = (offset + days).div_ceil(7);
+
+        let head_h = 28.0;
+        let avail = ui.available_size();
+        let cell_w = avail.x / 7.0;
+        let cell_h = ((avail.y - head_h) / rows as f32).max(70.0);
+        let (grid, _) = ui.allocate_exact_size(vec2(avail.x, head_h + cell_h * rows as f32), Sense::hover());
+        let painter = ui.painter_at(grid);
         let today = Local::now().date_naive();
-        let mut clicked = None;
-        egui::Grid::new("cal").spacing([4.0, 4.0]).show(ui, |ui| {
-            for d in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] {
-                ui.label(d);
-            }
-            ui.end_row();
 
-            let offset = self.month.weekday().num_days_from_monday() as usize;
-            let mut col = 0;
-            for _ in 0..offset {
-                ui.label("");
-                col += 1;
+        for (i, name) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().enumerate() {
+            let r = egui::Rect::from_min_size(grid.min + vec2(cell_w * i as f32, 0.0), vec2(cell_w, head_h));
+            painter.rect_filled(r.shrink(1.0), 4.0, Color32::from_rgb(219, 234, 254));
+            painter.text(r.center(), Align2::CENTER_CENTER, *name, FontId::proportional(15.0), Color32::from_rgb(30, 64, 175));
+        }
+
+        let mut clicked = None;
+        let mut double_clicked = None;
+        for n in 0..days {
+            let day = first + chrono::Days::new(n as u64);
+            let slot = offset + n;
+            let (col, row) = (slot % 7, slot / 7);
+            let rect = egui::Rect::from_min_size(
+                grid.min + vec2(cell_w * col as f32, head_h + cell_h * row as f32),
+                vec2(cell_w, cell_h),
+            )
+            .shrink(1.5);
+
+            let resp = ui.interact(rect, ui.id().with(("day", n)), Sense::click());
+            let bg = if day == today {
+                Color32::from_rgb(220, 252, 231)
+            } else if col >= 5 {
+                Color32::from_rgb(224, 242, 254)
+            } else if resp.hovered() {
+                Color32::from_rgb(254, 249, 195)
+            } else {
+                Color32::WHITE
+            };
+            painter.rect_filled(rect, 6.0, bg);
+            let border = if day == self.selected {
+                Stroke::new(2.5, BLUE)
+            } else {
+                Stroke::new(1.0, Color32::from_rgb(203, 213, 225))
+            };
+            painter.rect_stroke(rect, 6.0, border, egui::StrokeKind::Inside);
+            painter.text(
+                rect.min + vec2(8.0, 6.0),
+                Align2::LEFT_TOP,
+                day.day().to_string(),
+                FontId::proportional(17.0),
+                Color32::from_rgb(51, 65, 85),
+            );
+
+            let entries = self.day_entries(day);
+            let pill_h = 18.0;
+            let top = rect.min.y + 30.0;
+            let fit = (((rect.max.y - top - 4.0) / (pill_h + 2.0)).floor() as usize).max(1);
+            let shown = if entries.len() > fit { fit - 1 } else { entries.len() };
+            for (i, e) in entries.iter().take(shown).enumerate() {
+                let c = self.cat_color(&e.category);
+                let pr = egui::Rect::from_min_size(
+                    egui::pos2(rect.min.x + 4.0, top + i as f32 * (pill_h + 2.0)),
+                    vec2(rect.width() - 8.0, pill_h),
+                );
+                painter.rect_filled(pr, 9.0, c);
+                painter.with_clip_rect(pr.shrink2(vec2(4.0, 0.0))).text(
+                    egui::pos2(pr.min.x + 7.0, pr.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("{} {}", &e.added_at[11..16.min(e.added_at.len())], first_line(&e.text)),
+                    FontId::proportional(12.0),
+                    text_on(c),
+                );
             }
-            let mut day = self.month;
-            while day.month() == self.month.month() {
-                let flag = self.entries.contains_key(&key(day));
-                let text = if flag { format!("{}*", day.day()) } else { day.day().to_string() };
-                let mut btn = egui::Button::new(text).min_size(egui::vec2(34.0, 28.0));
-                if day == self.selected {
-                    btn = btn.selected(true);
-                } else if flag {
-                    btn = btn.fill(egui::Color32::from_rgb(40, 110, 70));
-                }
-                let mut resp = ui.add(btn);
-                if day == today {
-                    resp = resp.on_hover_text("Today");
-                }
-                if resp.clicked() {
-                    clicked = Some(day);
-                }
-                col += 1;
-                if col % 7 == 0 {
-                    ui.end_row();
-                }
-                day = day.succ_opt().unwrap();
+            if entries.len() > shown {
+                painter.text(
+                    egui::pos2(rect.min.x + 8.0, top + shown as f32 * (pill_h + 2.0) + pill_h / 2.0),
+                    Align2::LEFT_CENTER,
+                    format!("+{} more", entries.len() - shown),
+                    FontId::proportional(12.0),
+                    Color32::from_rgb(71, 85, 105),
+                );
             }
-        });
-        ui.add_space(6.0);
-        ui.label("* = day has an entry");
+
+            if resp.clicked() {
+                clicked = Some(day);
+            }
+            if resp.double_clicked() {
+                double_clicked = Some(day);
+            }
+        }
         if let Some(d) = clicked {
-            self.select(d);
+            self.selected = d;
+        }
+        if let Some(d) = double_clicked {
+            self.new_entry(d);
         }
     }
 
-    fn editor(&mut self, ui: &mut egui::Ui) {
-        ui.heading(self.selected.format("%A, %e %B %Y").to_string());
-        ui.separator();
-        let exists = self.entries.contains_key(&key(self.selected));
+    fn shift_target(&self, first: NaiveDate) -> NaiveDate {
+        let total = first.year() * 12 + first.month0() as i32 + 1;
+        NaiveDate::from_ymd_opt(total.div_euclid(12), total.rem_euclid(12) as u32 + 1, 1).unwrap()
+    }
 
-        if self.editing {
-            ui.add_sized(
-                [ui.available_width(), ui.available_height() - 40.0],
-                egui::TextEdit::multiline(&mut self.draft).hint_text("What's on your mind today?"),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    let text = self.draft.trim().to_string();
-                    if text.is_empty() {
-                        self.entries.remove(&key(self.selected));
-                    } else {
-                        self.draft = text.clone();
-                        self.entries.insert(key(self.selected), text);
-                    }
-                    self.persist();
-                    self.editing = false;
-                }
-                if exists && ui.button("Cancel").clicked() {
-                    self.select(self.selected);
-                }
-            });
-        } else {
-            egui::ScrollArea::vertical()
-                .max_height(ui.available_height() - 40.0)
-                .show(ui, |ui| {
-                    ui.add(egui::Label::new(&self.draft).wrap());
-                });
-            ui.horizontal(|ui| {
-                if ui.button("Edit").clicked() {
-                    self.editing = true;
-                }
-                if ui.button("Delete").clicked() {
-                    self.entries.remove(&key(self.selected));
-                    self.persist();
-                    self.select(self.selected);
-                }
-            });
+    fn day_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new(self.selected.format("%A").to_string()).size(14.0).color(Color32::from_rgb(71, 85, 105)));
+        ui.label(RichText::new(self.selected.format("%e %B %Y").to_string()).size(22.0).strong().color(Color32::from_rgb(30, 64, 175)));
+        ui.add_space(6.0);
+        if ui.button("➕ Add entry for this day").clicked() {
+            self.new_entry(self.selected);
         }
-        if !self.status.is_empty() {
-            ui.weak(&self.status);
+        ui.add_space(8.0);
+        ui.separator();
+
+        let entries: Vec<Entry> = self.day_entries(self.selected).into_iter().cloned().collect();
+        let mut edit = None;
+        let mut delete = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if entries.is_empty() {
+                ui.add_space(8.0);
+                ui.label("No entries for this day yet.");
+            }
+            for e in &entries {
+                let c = self.cat_color(&e.category);
+                let fg = text_on(c);
+                egui::Frame::new()
+                    .fill(c)
+                    .corner_radius(10)
+                    .inner_margin(10)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&e.category).strong().color(fg));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let time = e.added_at.get(11..16).unwrap_or("");
+                                ui.label(RichText::new(format!("Added {time}")).small().color(fg));
+                            });
+                        });
+                        ui.add(egui::Label::new(RichText::new(&e.text).color(fg)).wrap());
+                        ui.horizontal(|ui| {
+                            if ui.button("Edit").clicked() {
+                                edit = Some(e.id);
+                            }
+                            if ui.add(egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(RED)).clicked() {
+                                delete = Some(e.id);
+                            }
+                        });
+                    });
+                ui.add_space(6.0);
+            }
+        });
+
+        if let Some(id) = edit {
+            if let Some(e) = self.data.entries.iter().find(|e| e.id == id) {
+                self.editor = Some(EditState {
+                    id: Some(id),
+                    date: self.selected,
+                    category: e.category.clone(),
+                    text: e.text.clone(),
+                });
+            }
+        }
+        if let Some(id) = delete {
+            self.data.entries.retain(|e| e.id != id);
+            self.persist();
+        }
+    }
+
+    fn entry_window(&mut self, ctx: &egui::Context) {
+        let Some(ed) = &mut self.editor else { return };
+        let cats = &self.data.categories;
+        let mut open = true;
+        let mut save_it = false;
+        let mut cancel = false;
+
+        egui::Window::new(if ed.id.is_some() { "Edit entry" } else { "New entry" })
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new(ed.date.format("%A, %e %B %Y").to_string()).strong());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Category:");
+                    let sel_color = rgb(cats.iter().find(|c| c.name == ed.category).map_or(GREY, |c| c.color));
+                    egui::ComboBox::from_id_salt("cat")
+                        .selected_text(RichText::new(&ed.category).strong().color(text_on(sel_color)).background_color(sel_color))
+                        .show_ui(ui, |ui| {
+                            for c in cats {
+                                let col = rgb(c.color);
+                                ui.selectable_value(
+                                    &mut ed.category,
+                                    c.name.clone(),
+                                    RichText::new(&c.name).strong().color(text_on(col)).background_color(col),
+                                );
+                            }
+                        });
+                });
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut ed.text)
+                        .desired_rows(8)
+                        .desired_width(380.0)
+                        .hint_text("What's on your mind?"),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let can_save = !ed.text.trim().is_empty();
+                    if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
+                        save_it = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if save_it {
+            let ed = self.editor.take().unwrap();
+            let text = ed.text.trim().to_string();
+            match ed.id {
+                Some(id) => {
+                    if let Some(e) = self.data.entries.iter_mut().find(|e| e.id == id) {
+                        e.text = text;
+                        e.category = ed.category;
+                    }
+                }
+                None => {
+                    let id = self.data.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+                    self.data.entries.push(Entry {
+                        id,
+                        date: key(ed.date),
+                        added_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                        category: ed.category,
+                        text,
+                    });
+                }
+            }
+            self.selected = ed.date;
+            self.persist();
+        } else if cancel || !open {
+            self.editor = None;
+        }
+    }
+
+    fn categories_window(&mut self, ctx: &egui::Context) {
+        if !self.show_categories {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        let mut remove = None;
+
+        egui::Window::new("Categories")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let can_delete = self.data.categories.len() > 1;
+                for (i, c) in self.data.categories.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        changed |= ui.color_edit_button_srgb(&mut c.color).changed();
+                        let col = rgb(c.color);
+                        ui.label(RichText::new(format!("  {}  ", c.name)).strong().color(text_on(col)).background_color(col));
+                        if ui.add_enabled(can_delete, egui::Button::new("Delete")).clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                ui.separator();
+                ui.label("Add a category");
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgb(&mut self.new_cat_color);
+                    ui.add(egui::TextEdit::singleline(&mut self.new_cat_name).hint_text("Name").desired_width(160.0));
+                    let name = self.new_cat_name.trim().to_string();
+                    let dup = self.data.categories.iter().any(|c| c.name.eq_ignore_ascii_case(&name));
+                    if ui.add_enabled(!name.is_empty() && !dup, egui::Button::new("Add")).clicked() {
+                        self.data.categories.push(Category { name, color: self.new_cat_color });
+                        self.new_cat_name.clear();
+                        changed = true;
+                    }
+                });
+                ui.weak("Entries in a deleted category show in grey.");
+            });
+
+        if let Some(i) = remove {
+            self.data.categories.remove(i);
+            changed = true;
+        }
+        if changed {
+            self.persist();
+        }
+        if !open {
+            self.show_categories = false;
         }
     }
 }
 
+fn setup_style(ctx: &egui::Context) {
+    let mut v = egui::Visuals::light();
+    v.panel_fill = PAGE_BG;
+    v.window_fill = Color32::WHITE;
+    v.window_corner_radius = 12.into();
+    v.window_stroke = Stroke::new(1.5, BLUE);
+    v.extreme_bg_color = Color32::WHITE;
+    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+        w.corner_radius = 8.into();
+        w.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    }
+    v.widgets.inactive.weak_bg_fill = BLUE;
+    v.widgets.inactive.bg_fill = BLUE;
+    v.widgets.hovered.weak_bg_fill = BLUE_HOVER;
+    v.widgets.hovered.bg_fill = BLUE_HOVER;
+    v.widgets.active.weak_bg_fill = BLUE_HOVER;
+    v.widgets.active.bg_fill = BLUE_HOVER;
+    v.selection.bg_fill = Color32::from_rgb(147, 197, 253);
+    ctx.set_visuals(v);
+    ctx.global_style_mut(|s| s.spacing.button_padding = vec2(10.0, 5.0));
+}
+
 impl eframe::App for DiaryApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::left("calendar").resizable(false).show(ui, |ui| self.calendar(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.editor(ui));
+        let ctx = ui.ctx().clone();
+        egui::Panel::top("header")
+            .frame(egui::Frame::new().fill(BLUE).inner_margin(egui::Margin::symmetric(14, 10)))
+            .show(ui, |ui| self.header(ui));
+        egui::Panel::right("day")
+            .default_size(330.0)
+            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(14))
+            .show(ui, |ui| self.day_panel(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(PAGE_BG).inner_margin(10))
+            .show(ui, |ui| self.calendar(ui));
+
+        self.entry_window(&ctx);
+        self.categories_window(&ctx);
     }
 }
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([760.0, 460.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 720.0]).with_min_inner_size([800.0, 500.0]),
         ..Default::default()
     };
-    eframe::run_native("Diary", options, Box::new(|_cc| Ok(Box::new(DiaryApp::new()))))
+    eframe::run_native(
+        "Diary",
+        options,
+        Box::new(|cc| {
+            setup_style(&cc.egui_ctx);
+            Ok(Box::new(DiaryApp::new()))
+        }),
+    )
 }
