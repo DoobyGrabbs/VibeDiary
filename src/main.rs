@@ -442,7 +442,8 @@ impl DiaryApp {
             .resizable(true)
             .default_size([480.0, 380.0])
             .min_size([320.0, 240.0])
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 ui.label(RichText::new(ed.date.format("%A, %e %B %Y").to_string()).strong());
                 ui.add_space(6.0);
@@ -527,14 +528,17 @@ impl DiaryApp {
             .resizable(true)
             .default_size([520.0, 420.0])
             .min_size([360.0, 260.0])
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 let can_delete = self.data.categories.len() > 1;
                 let names: Vec<String> = self.data.categories.iter().map(|c| c.name.clone()).collect();
-                let big = FontId::proportional(22.0);
-                let field_margin = egui::Margin::symmetric(10, 8);
+                let big = FontId::proportional(18.0);
+                let row_h = 36.0;
+                let field_margin = egui::Margin::symmetric(10, 0);
                 for (i, c) in self.data.categories.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().interact_size = vec2(48.0, row_h);
                         changed |= ui.color_edit_button_srgb(&mut c.color).changed();
 
                         // Delete sits at the right edge; the name field takes the space in between.
@@ -553,6 +557,8 @@ impl DiaryApp {
                                 egui::TextEdit::singleline(&mut text)
                                     .font(big.clone())
                                     .margin(field_margin)
+                                    .min_size(vec2(0.0, row_h))
+                                    .vertical_align(egui::Align::Center)
                                     .text_color(p.ink)
                                     .desired_width(ui.available_width()),
                             );
@@ -575,6 +581,7 @@ impl DiaryApp {
                 ui.separator();
                 ui.label("Add a category");
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().interact_size = vec2(48.0, row_h);
                     ui.color_edit_button_srgb(&mut self.new_cat_color);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let name = self.new_cat_name.trim().to_string();
@@ -588,6 +595,8 @@ impl DiaryApp {
                             egui::TextEdit::singleline(&mut self.new_cat_name)
                                 .font(big.clone())
                                 .margin(field_margin)
+                                .min_size(vec2(0.0, row_h))
+                                .vertical_align(egui::Align::Center)
                                 .hint_text("Name")
                                 .text_color(p.ink)
                                 .desired_width(ui.available_width()),
