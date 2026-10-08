@@ -119,6 +119,8 @@ struct DiaryApp {
     show_categories: bool,
     new_cat_name: String,
     new_cat_color: [u8; 3],
+    /// Category row being renamed and its in-progress text.
+    rename_buf: Option<(usize, String)>,
     status: String,
 }
 
@@ -133,6 +135,7 @@ impl DiaryApp {
             show_categories: false,
             new_cat_name: String::new(),
             new_cat_color: [59, 130, 246],
+            rename_buf: None,
             status: String::new(),
         }
     }
@@ -451,6 +454,7 @@ impl DiaryApp {
         let mut open = true;
         let mut changed = false;
         let mut remove = None;
+        let mut renames: Vec<(String, String)> = Vec::new();
 
         egui::Window::new("Categories")
             .open(&mut open)
@@ -459,16 +463,37 @@ impl DiaryApp {
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 let can_delete = self.data.categories.len() > 1;
-                for (i, c) in self.data.categories.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
+                let names: Vec<String> = self.data.categories.iter().map(|c| c.name.clone()).collect();
+                egui::Grid::new("cats").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+                    for (i, c) in self.data.categories.iter_mut().enumerate() {
                         changed |= ui.color_edit_button_srgb(&mut c.color).changed();
-                        let col = rgb(c.color);
-                        ui.label(RichText::new(format!("  {}  ", c.name)).strong().color(text_on(col)).background_color(col));
-                        if ui.add_enabled(can_delete, egui::Button::new("Delete")).clicked() {
+
+                        // Edit a buffered copy and only apply the rename when editing finishes.
+                        let mut text = match &self.rename_buf {
+                            Some((j, b)) if *j == i => b.clone(),
+                            _ => c.name.clone(),
+                        };
+                        let resp = ui.add(egui::TextEdit::singleline(&mut text).text_color(INK).desired_width(200.0));
+                        if resp.changed() {
+                            self.rename_buf = Some((i, text));
+                        } else if resp.lost_focus() {
+                            if let Some((j, new)) = self.rename_buf.take() {
+                                let new = new.trim().to_string();
+                                let clash = names.iter().enumerate().any(|(k, n)| k != j && n.eq_ignore_ascii_case(&new));
+                                if j == i && !new.is_empty() && !clash && new != c.name {
+                                    renames.push((std::mem::replace(&mut c.name, new.clone()), new));
+                                }
+                            }
+                        }
+
+                        let del = egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(RED);
+                        if ui.add_enabled(can_delete, del).clicked() {
                             remove = Some(i);
                         }
-                    });
-                }
+                        ui.end_row();
+                    }
+                });
+                ui.weak("Click a name to rename it; press Enter to apply.");
                 ui.separator();
                 ui.label("Add a category");
                 ui.horizontal(|ui| {
@@ -485,6 +510,15 @@ impl DiaryApp {
                 ui.weak("Entries in a deleted category show in grey.");
             });
 
+        for (old, new) in renames {
+            for e in self.data.entries.iter_mut().filter(|e| e.category == old) {
+                e.category = new.clone();
+            }
+            if let Some(ed) = self.editor.as_mut().filter(|ed| ed.category == old) {
+                ed.category = new;
+            }
+            changed = true;
+        }
         if let Some(i) = remove {
             self.data.categories.remove(i);
             changed = true;
@@ -502,8 +536,9 @@ fn setup_style(ctx: &egui::Context) {
     let mut v = egui::Visuals::light();
     v.panel_fill = PAGE_BG;
     v.window_fill = Color32::WHITE;
-    v.window_corner_radius = 12.into();
-    v.window_stroke = Stroke::new(1.5, BLUE);
+    v.window_corner_radius = 0.into();
+    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(100, 116, 139));
+    v.window_shadow = egui::Shadow { offset: [0, 10], blur: 32, spread: 4, color: Color32::from_black_alpha(150) };
     v.extreme_bg_color = Color32::WHITE;
     for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
         w.corner_radius = 8.into();
