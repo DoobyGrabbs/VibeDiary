@@ -288,6 +288,11 @@ struct DiaryApp {
     status: String,
     media: markdown::Media,
     show_marks: bool,
+    view: CalView,
+    /// Entry being dragged on the calendar.
+    drag: Option<u64>,
+    /// Scroll the day view to the working hours on its next frame.
+    day_scroll_pending: bool,
     search: String,
     last_activity: std::time::Instant,
     /// Images used by an unsaved draft, kept while the diary is locked.
@@ -323,6 +328,9 @@ impl DiaryApp {
             status: String::new(),
             media: markdown::Media::default(),
             show_marks: false,
+            view: CalView::Month,
+            drag: None,
+            day_scroll_pending: true,
             search: String::new(),
             last_activity: std::time::Instant::now(),
             draft_images: BTreeMap::new(),
@@ -530,9 +538,6 @@ impl DiaryApp {
         }
     }
 
-    fn cat_color(&self, name: &str) -> Color32 {
-        rgb(self.data.categories.iter().find(|c| c.name == name).map_or(GREY, |c| c.color))
-    }
 
     fn day_entries(&self, d: NaiveDate) -> Vec<&Entry> {
         let k = key(d);
@@ -547,19 +552,29 @@ impl DiaryApp {
     }
 
     fn new_entry(&mut self, date: NaiveDate) {
+        self.new_entry_at(date, None);
+    }
+
+    /// Start a new entry; `hour` picks the time (on the hour), otherwise it is now.
+    fn new_entry_at(&mut self, date: NaiveDate, hour: Option<u32>) {
         let category = self.data.categories.first().map(|c| c.name.clone()).unwrap_or_default();
         let now = Local::now();
+        let (hour, minute, second) = match hour {
+            Some(h) => (h, 0, 0),
+            None => (now.hour(), now.minute(), now.second()),
+        };
         self.editor = Some(EditState {
             id: None,
             date,
-            hour: now.hour(),
-            minute: now.minute(),
-            second: now.second(),
+            hour,
+            minute,
+            second,
             category,
             text: String::new(),
             focus: 0,
             want_focus: Some((usize::MAX, usize::MAX)),
         });
+        self.editor_msg.clear();
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
@@ -567,20 +582,6 @@ impl DiaryApp {
         ui.horizontal_centered(|ui| {
             ui.label(RichText::new("My Diary").size(24.0).strong().color(Color32::WHITE));
             ui.add_space(24.0);
-            let white = |s: &str| RichText::new(s).size(18.0).strong().color(Color32::WHITE);
-            if ui.button("◀").clicked() {
-                self.shift_month(-1);
-            }
-            ui.label(white(&self.month.format("%B %Y").to_string()));
-            if ui.button("▶").clicked() {
-                self.shift_month(1);
-            }
-            if ui.button("Today").clicked() {
-                let t = Local::now().date_naive();
-                self.selected = t;
-                self.month = t.with_day(1).unwrap();
-                self.search.clear();
-            }
             ui.add_space(8.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.search)
@@ -639,21 +640,122 @@ impl DiaryApp {
         }
     }
 
-    fn calendar(&mut self, ui: &mut egui::Ui) {
-        let first = self.month;
-        let next = self.shift_target(first);
-        let days = (next - first).num_days() as u32;
-        let offset = first.weekday().num_days_from_monday();
-        let rows = (offset + days).div_ceil(7);
+    /// Toolbar above the calendar: navigation, title and the Month / Week / Day switch.
+    fn calendar_toolbar(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui.ctx());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = 34.0;
+            let step = |app: &mut Self, dir: i64| match app.view {
+                CalView::Month => app.shift_month(dir as i32),
+                CalView::Week => app.shift_days(7 * dir),
+                CalView::Day => app.shift_days(dir),
+            };
+            if ui.button("◀").clicked() {
+                step(self, -1);
+            }
+            if ui.button("▶").clicked() {
+                step(self, 1);
+            }
+            ui.add_space(6.0);
+            ui.label(RichText::new(self.calendar_title()).size(24.0).strong().color(p.title));
+            ui.add_space(6.0);
+            if ui.button("Today").clicked() {
+                let t = Local::now().date_naive();
+                self.selected = t;
+                self.month = t.with_day(1).unwrap();
+                self.day_scroll_pending = true;
+                self.search.clear();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for (view, label) in [(CalView::Day, "Day"), (CalView::Week, "Week"), (CalView::Month, "Month")] {
+                    let selected = self.view == view;
+                    let mut button = egui::Button::new(RichText::new(label).strong().color(Color32::WHITE));
+                    if selected {
+                        button = button.fill(Color32::from_rgb(23, 37, 84)).stroke(Stroke::new(2.0, p.accent));
+                    }
+                    if ui.add(button).clicked() {
+                        self.view = view;
+                        self.day_scroll_pending = true;
+                    }
+                }
+            });
+        });
+    }
 
+    fn calendar_title(&self) -> String {
+        match self.view {
+            CalView::Month => self.month.format("%B %Y").to_string(),
+            CalView::Week => week_title(self.selected),
+            CalView::Day => self.selected.format("%A %e %B %Y").to_string(),
+        }
+    }
+
+    fn shift_days(&mut self, delta: i64) {
+        let moved = if delta >= 0 {
+            self.selected.checked_add_days(chrono::Days::new(delta as u64))
+        } else {
+            self.selected.checked_sub_days(chrono::Days::new(delta.unsigned_abs()))
+        };
+        if let Some(d) = moved {
+            self.selected = d;
+            self.month = d.with_day(1).unwrap();
+            self.day_scroll_pending = true;
+        }
+    }
+
+    fn calendar(&mut self, ui: &mut egui::Ui) {
+        self.calendar_toolbar(ui);
+        ui.add_space(6.0);
+
+        let mut ev = CalEvents::default();
+        match self.view {
+            CalView::Month => {
+                let first = self.month;
+                let days = (self.shift_target(first) - first).num_days() as u64;
+                let days: Vec<NaiveDate> = (0..days).map(|n| first + chrono::Days::new(n)).collect();
+                self.grid_view(ui, &mut ev, &days, first.weekday().num_days_from_monday(), 21.0);
+            }
+            CalView::Week => {
+                let monday = week_start(self.selected);
+                let days: Vec<NaiveDate> = (0..7).map(|n| monday + chrono::Days::new(n)).collect();
+                self.grid_view(ui, &mut ev, &days, 0, 28.0);
+            }
+            CalView::Day => self.day_timeline(ui, &mut ev),
+        }
+
+        // Escape cancels a drag in progress.
+        if self.drag.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.drag = None;
+        }
+        if let Some(d) = ev.select {
+            self.selected = d;
+            self.month = d.with_day(1).unwrap();
+        }
+        if let Some((d, hour)) = ev.new_on {
+            self.selected = d;
+            self.new_entry_at(d, hour);
+        }
+        if let Some(id) = ev.edit {
+            self.start_edit(id);
+        }
+        if let Some((id, date, hour)) = ev.drop {
+            self.move_entry(id, date, hour);
+        }
+    }
+
+    /// Month and week views: a grid of day cells, seven to a row.
+    fn grid_view(&mut self, ui: &mut egui::Ui, ev: &mut CalEvents, days: &[NaiveDate], offset: u32, pill_h: f32) {
+        let rows = (offset + days.len() as u32).div_ceil(7);
         let head_h = 28.0;
         let avail = ui.available_size();
         let cell_w = avail.x / 7.0;
-        let cell_h = ((avail.y - head_h) / rows as f32).max(70.0);
+        let min_h = if rows == 1 { 220.0 } else { 70.0 };
+        let cell_h = ((avail.y - head_h) / rows as f32).max(min_h);
         let (grid, _) = ui.allocate_exact_size(vec2(avail.x, head_h + cell_h * rows as f32), Sense::hover());
         let painter = ui.painter_at(grid);
         let p = palette(ui.ctx());
         let today = Local::now().date_naive();
+        let text_size = if rows == 1 { 15.0 } else { 14.0 };
 
         for (i, name) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().enumerate() {
             let r = egui::Rect::from_min_size(grid.min + vec2(cell_w * i as f32, 0.0), vec2(cell_w, head_h));
@@ -661,86 +763,179 @@ impl DiaryApp {
             painter.text(r.center(), Align2::CENTER_CENTER, *name, FontId::proportional(16.0), p.head_text);
         }
 
-        let mut clicked = None;
-        let mut double_clicked = None;
-        for n in 0..days {
-            let day = first + chrono::Days::new(n as u64);
-            let slot = offset + n;
+        let by_day: Vec<Vec<Entry>> = days.iter().map(|d| self.day_entries(*d).into_iter().cloned().collect()).collect();
+        let cats = &self.data.categories;
+        let drag = &mut self.drag;
+        let selected = self.selected;
+        let mut cells: Vec<(egui::Rect, NaiveDate)> = Vec::new();
+
+        for (n, day) in days.iter().copied().enumerate() {
+            let slot = offset as usize + n;
             let (col, row) = (slot % 7, slot / 7);
             let rect = egui::Rect::from_min_size(
                 grid.min + vec2(cell_w * col as f32, head_h + cell_h * row as f32),
                 vec2(cell_w, cell_h),
             )
             .shrink(1.5);
+            cells.push((rect, day));
 
-            let resp = ui.interact(rect, ui.id().with(("day", n)), Sense::click());
+            let resp = ui.interact(rect, ui.id().with(("cell", day)), Sense::click());
             let bg = if day == today {
                 p.today
             } else if col >= 5 {
                 p.weekend
-            } else if resp.hovered() {
+            } else if resp.hovered() && drag.is_none() {
                 p.hover
             } else {
                 p.cell
             };
             painter.rect_filled(rect, 6.0, bg);
-            let border = if day == self.selected {
-                Stroke::new(2.5, p.accent)
-            } else {
-                Stroke::new(1.0, p.cell_border)
-            };
+            let border = if day == selected { Stroke::new(2.5, p.accent) } else { Stroke::new(1.0, p.cell_border) };
             painter.rect_stroke(rect, 6.0, border, egui::StrokeKind::Inside);
-            painter.text(
-                rect.min + vec2(8.0, 6.0),
-                Align2::LEFT_TOP,
-                day.day().to_string(),
-                FontId::proportional(19.0),
-                p.day_num,
-            );
+            painter.text(rect.min + vec2(8.0, 6.0), Align2::LEFT_TOP, day.day().to_string(), FontId::proportional(19.0), p.day_num);
 
-            let entries = self.day_entries(day);
-            let pill_h = 21.0;
+            let entries = &by_day[n];
             let top = rect.min.y + 30.0;
             let fit = (((rect.max.y - top - 4.0) / (pill_h + 2.0)).floor() as usize).max(1);
             let shown = if entries.len() > fit { fit - 1 } else { entries.len() };
             for (i, e) in entries.iter().take(shown).enumerate() {
-                let c = self.cat_color(&e.category);
                 let pr = egui::Rect::from_min_size(
                     egui::pos2(rect.min.x + 4.0, top + i as f32 * (pill_h + 2.0)),
                     vec2(rect.width() - 8.0, pill_h),
                 );
-                painter.rect_filled(pr, 9.0, c);
-                painter.with_clip_rect(pr.shrink2(vec2(4.0, 0.0))).text(
-                    egui::pos2(pr.min.x + 7.0, pr.center().y),
-                    Align2::LEFT_CENTER,
-                    format!("{} {}", e.added_at.get(11..16).unwrap_or(""), markdown::summary(&e.text)),
-                    FontId::proportional(14.0),
-                    text_on(c),
-                );
+                pill(ui, &painter, pr, e, cats, text_size, drag, ev);
             }
             if entries.len() > shown {
                 painter.text(
                     egui::pos2(rect.min.x + 8.0, top + shown as f32 * (pill_h + 2.0) + pill_h / 2.0),
                     Align2::LEFT_CENTER,
                     format!("+{} more", entries.len() - shown),
-                    FontId::proportional(14.0),
+                    FontId::proportional(text_size),
                     p.muted,
                 );
             }
 
-            if resp.clicked() {
-                clicked = Some(day);
-            }
             if resp.double_clicked() {
-                double_clicked = Some(day);
+                ev.new_on = Some((day, None));
+            } else if resp.clicked() {
+                ev.select = Some(day);
             }
         }
-        if let Some(d) = clicked {
-            self.selected = d;
+
+        // Dropping an entry on a day moves it there; the day under the pointer is outlined.
+        let pointer = ui.ctx().pointer_latest_pos();
+        if let Some((id, pos)) = ev.drop_at.take() {
+            if let Some((_, d)) = cells.iter().find(|(r, _)| r.contains(pos)) {
+                ev.drop = Some((id, *d, None));
+            }
         }
-        if let Some(d) = double_clicked {
-            self.new_entry(d);
+        if drag.is_some() {
+            if let Some((r, _)) = pointer.and_then(|pos| cells.iter().find(|(r, _)| r.contains(pos))) {
+                painter.rect_stroke(*r, 6.0, Stroke::new(3.0, p.accent), egui::StrokeKind::Inside);
+            }
         }
+    }
+
+    /// Day view: the selected day hour by hour. Entries sit in the hour they were made.
+    fn day_timeline(&mut self, ui: &mut egui::Ui, ev: &mut CalEvents) {
+        let p = palette(ui.ctx());
+        let day = self.selected;
+        let now = Local::now();
+        let entries: Vec<Entry> = self.day_entries(day).into_iter().cloned().collect();
+        let first_hour = entries.iter().filter_map(|e| entry_time(&e.added_at).map(|t| t.0)).min().unwrap_or(8).min(8);
+        let cats = &self.data.categories;
+        let drag = &mut self.drag;
+        let scroll_pending = &mut self.day_scroll_pending;
+        let mut rows: Vec<(egui::Rect, u32)> = Vec::new();
+
+        egui::ScrollArea::vertical().id_salt("day_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            let width = ui.available_width();
+            let gutter = 64.0;
+            for hour in 0..24u32 {
+                let in_hour: Vec<&Entry> = entries.iter().filter(|e| entry_time(&e.added_at).map(|t| t.0) == Some(hour)).collect();
+                let row_h = (in_hour.len() as f32 * 32.0 + 12.0).max(56.0);
+                let (rect, _) = ui.allocate_exact_size(vec2(width, row_h), Sense::hover());
+                if *scroll_pending && hour == first_hour {
+                    ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                    *scroll_pending = false;
+                }
+                let painter = ui.painter_at(rect);
+                let slot = egui::Rect::from_min_max(rect.min + vec2(gutter, 0.0), rect.max);
+                rows.push((slot, hour));
+                let resp = ui.interact(slot, ui.id().with(("hour", hour)), Sense::click());
+                let bg = if day == now.date_naive() && hour == now.hour() {
+                    p.today
+                } else if resp.hovered() && drag.is_none() {
+                    p.hover
+                } else if !(7..22).contains(&hour) {
+                    p.weekend
+                } else {
+                    p.cell
+                };
+                painter.rect_filled(slot.shrink(1.0), 4.0, bg);
+                painter.rect_stroke(slot.shrink(1.0), 4.0, Stroke::new(1.0, p.cell_border), egui::StrokeKind::Inside);
+                painter.text(
+                    egui::pos2(rect.min.x + gutter - 10.0, rect.min.y + 8.0),
+                    Align2::RIGHT_TOP,
+                    format!("{hour:02}:00"),
+                    FontId::proportional(15.0),
+                    p.muted,
+                );
+                for (i, e) in in_hour.iter().enumerate() {
+                    let pr = egui::Rect::from_min_size(slot.min + vec2(8.0, 8.0 + i as f32 * 32.0), vec2(slot.width() - 16.0, 28.0));
+                    pill(ui, &painter, pr, e, cats, 16.0, drag, ev);
+                }
+                if resp.double_clicked() {
+                    ev.new_on = Some((day, Some(hour)));
+                }
+            }
+        });
+
+        // Dropping an entry on an hour changes its time (keeping the minutes).
+        let pointer = ui.ctx().pointer_latest_pos();
+        if let Some((id, pos)) = ev.drop_at.take() {
+            if let Some((_, h)) = rows.iter().find(|(r, _)| r.contains(pos)) {
+                ev.drop = Some((id, day, Some(*h)));
+            }
+        }
+        if drag.is_some() {
+            if let Some((r, _)) = pointer.and_then(|pos| rows.iter().find(|(r, _)| r.contains(pos))) {
+                ui.painter().rect_stroke(*r, 4.0, Stroke::new(3.0, p.accent), egui::StrokeKind::Inside);
+            }
+        }
+    }
+
+    /// Move an entry to another day (and, in the day view, another hour).
+    fn move_entry(&mut self, id: u64, date: NaiveDate, hour: Option<u32>) {
+        let Some(e) = self.data.entries.iter_mut().find(|e| e.id == id) else { return };
+        let new_stamp = moved_timestamp(&e.added_at, date, hour);
+        if e.date == key(date) && e.added_at == new_stamp {
+            return;
+        }
+        e.date = key(date);
+        e.added_at = new_stamp;
+        self.selected = date;
+        self.month = date.with_day(1).unwrap();
+        self.persist();
+    }
+
+    /// Open the editor for an existing entry.
+    fn start_edit(&mut self, id: u64) {
+        let Some(e) = self.data.entries.iter().find(|e| e.id == id) else { return };
+        let date = NaiveDate::parse_from_str(&e.date, "%Y-%m-%d").unwrap_or(self.selected);
+        let (hour, minute, second) = entry_time(&e.added_at).unwrap_or((0, 0, 0));
+        self.editor = Some(EditState {
+            id: Some(id),
+            date,
+            hour,
+            minute,
+            second,
+            category: e.category.clone(),
+            text: e.text.clone(),
+            focus: 0,
+            want_focus: Some((usize::MAX, usize::MAX)),
+        });
+        self.editor_msg.clear();
     }
 
     fn shift_target(&self, first: NaiveDate) -> NaiveDate {
@@ -813,23 +1008,7 @@ impl DiaryApp {
         });
 
         if let Some(id) = edit {
-            if let Some(e) = self.data.entries.iter().find(|e| e.id == id) {
-                let date = NaiveDate::parse_from_str(&e.date, "%Y-%m-%d").unwrap_or(self.selected);
-                let time = chrono::NaiveTime::parse_from_str(e.added_at.get(11..).unwrap_or(""), "%H:%M:%S")
-                    .unwrap_or_default();
-                self.editor = Some(EditState {
-                    id: Some(id),
-                    date,
-                    hour: time.hour(),
-                    minute: time.minute(),
-                    second: time.second(),
-                    category: e.category.clone(),
-                    text: e.text.clone(),
-                    focus: 0,
-                    want_focus: Some((usize::MAX, usize::MAX)),
-                });
-                self.editor_msg.clear();
-            }
+            self.start_edit(id);
         }
         if let Some(id) = delete {
             self.data.entries.retain(|e| e.id != id);
@@ -1613,6 +1792,135 @@ mod tests {
             out.textures_delta.clear();
         }
     }
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn week_helpers() {
+        // 9 October 2026 is a Friday.
+        assert_eq!(week_start(d(2026, 10, 9)), d(2026, 10, 5));
+        assert_eq!(week_start(d(2026, 10, 5)), d(2026, 10, 5));
+        assert_eq!(week_start(d(2026, 10, 11)), d(2026, 10, 5));
+        assert_eq!(week_title(d(2026, 10, 9)), "5 – 11 October 2026");
+        assert_eq!(week_title(d(2026, 9, 30)), "28 Sep – 4 Oct 2026");
+        assert_eq!(week_title(d(2026, 12, 31)), "28 Dec 2026 – 3 Jan 2027");
+    }
+
+    #[test]
+    fn moving_an_entry_keeps_its_time_unless_an_hour_is_given() {
+        assert_eq!(entry_time("2026-10-08 16:11:27"), Some((16, 11, 27)));
+        assert_eq!(entry_time("garbage"), None);
+        assert_eq!(moved_timestamp("2026-10-08 16:11:27", d(2026, 10, 12), None), "2026-10-12 16:11:27");
+        assert_eq!(moved_timestamp("2026-10-08 16:11:27", d(2026, 10, 8), Some(9)), "2026-10-08 09:11:27");
+        assert_eq!(moved_timestamp("bad", d(2026, 1, 2), None), "2026-01-02 00:00:00");
+    }
+
+    fn app_with_entries() -> DiaryApp {
+        let mut app = DiaryApp::new();
+        app.lock = None;
+        app.data = fresh_data();
+        app.selected = d(2026, 10, 9);
+        app.month = d(2026, 10, 1);
+        for (id, date, time, text) in [
+            (1, "2026-10-09", "09:15:00", "# Morning **run**"),
+            (2, "2026-10-09", "09:40:30", "Coffee with Sam"),
+            (3, "2026-10-09", "21:05:00", "Evening notes\n\nmore"),
+            (4, "2026-10-12", "12:00:00", "Next week"),
+        ] {
+            app.data.entries.push(Entry {
+                id,
+                date: date.into(),
+                added_at: format!("{date} {time}"),
+                category: "Work".into(),
+                text: text.into(),
+            });
+        }
+        app
+    }
+
+    #[test]
+    fn entries_move_between_days_and_hours() {
+        let mut app = app_with_entries();
+        app.move_entry(1, d(2026, 10, 14), None);
+        let e = app.data.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!((e.date.as_str(), e.added_at.as_str()), ("2026-10-14", "2026-10-14 09:15:00"));
+        assert_eq!(app.selected, d(2026, 10, 14));
+
+        app.move_entry(2, d(2026, 10, 9), Some(17));
+        let e = app.data.entries.iter().find(|e| e.id == 2).unwrap();
+        assert_eq!((e.date.as_str(), e.added_at.as_str()), ("2026-10-09", "2026-10-09 17:40:30"));
+        assert!(app.day_entries(d(2026, 10, 9)).iter().any(|e| e.id == 2));
+        assert!(app.day_entries(d(2026, 10, 14)).iter().any(|e| e.id == 1));
+    }
+
+
+    #[test]
+    fn dragging_a_pill_to_another_day_moves_the_entry() {
+        let ctx = egui::Context::default();
+        setup_style(&ctx);
+        let mut app = app_with_entries();
+        app.view = CalView::Month;
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(1200.0, 800.0));
+        let (mut time, root) = (0.0f64, std::cell::Cell::new(None));
+        let mut frame = |app: &mut DiaryApp, events: Vec<egui::Event>| {
+            time += 0.1;
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                root.set(Some(ui.id()));
+                app.calendar(ui);
+            });
+            out.textures_delta.clear();
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+
+        let root = root.get().unwrap();
+        let center = |ctx: &egui::Context, id: egui::Id| ctx.read_response(id).expect("widget was laid out").rect.center();
+        let from = center(&ctx, root.with(("pill", 1u64)));
+        let to = center(&ctx, root.with(("cell", d(2026, 10, 14))));
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        frame(&mut app, vec![egui::Event::PointerMoved(from)]);
+        frame(&mut app, vec![button(from, true)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(from + vec2(30.0, 30.0))]);
+        assert_eq!(app.drag, Some(1), "the drag should have started");
+        frame(&mut app, vec![egui::Event::PointerMoved(to)]);
+        frame(&mut app, vec![button(to, false)]);
+        frame(&mut app, vec![]);
+
+        assert_eq!(app.drag, None);
+        let e = app.data.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e.date, "2026-10-14");
+        assert_eq!(e.added_at, "2026-10-14 09:15:00");
+    }
+    #[test]
+    fn all_calendar_views_render() {
+        let ctx = egui::Context::default();
+        setup_style(&ctx);
+        let mut app = app_with_entries();
+        for view in [CalView::Month, CalView::Week, CalView::Day, CalView::Month] {
+            app.view = view;
+            for _ in 0..3 {
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| app.calendar(ui));
+                out.textures_delta.clear();
+            }
+        }
+        // Navigation follows the view.
+        app.view = CalView::Week;
+        app.shift_days(7);
+        assert_eq!(app.selected, d(2026, 10, 16));
+        app.view = CalView::Day;
+        app.shift_days(-1);
+        assert_eq!(app.selected, d(2026, 10, 15));
+        assert_eq!(app.calendar_title(), "Thursday 15 October 2026");
+    }
 }
 
 fn seg_id(i: usize) -> egui::Id {
@@ -1683,4 +1991,115 @@ fn paint_cog(painter: &egui::Painter, center: egui::Pos2, r: f32, color: Color32
     }
     painter.circle_filled(center, r * 0.74, color);
     painter.circle_filled(center, r * 0.32, hole);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CalView {
+    Month,
+    Week,
+    Day,
+}
+
+/// What the user did on the calendar this frame.
+#[derive(Default)]
+struct CalEvents {
+    select: Option<NaiveDate>,
+    /// Double-click on empty space: new entry on this day (and hour, in the day view).
+    new_on: Option<(NaiveDate, Option<u32>)>,
+    edit: Option<u64>,
+    /// An entry was released here; the view works out which day/hour that is.
+    drop_at: Option<(u64, egui::Pos2)>,
+    /// Move this entry to this day (and hour).
+    drop: Option<(u64, NaiveDate, Option<u32>)>,
+}
+
+fn week_start(d: NaiveDate) -> NaiveDate {
+    d - chrono::Days::new(u64::from(d.weekday().num_days_from_monday()))
+}
+
+fn week_title(d: NaiveDate) -> String {
+    let (mon, sun) = (week_start(d), week_start(d) + chrono::Days::new(6));
+    if mon.month() == sun.month() && mon.year() == sun.year() {
+        format!("{} – {} {}", mon.day(), sun.day(), sun.format("%B %Y"))
+    } else if mon.year() == sun.year() {
+        format!("{} {} – {} {}", mon.day(), mon.format("%b"), sun.day(), sun.format("%b %Y"))
+    } else {
+        format!("{} {} – {} {}", mon.day(), mon.format("%b %Y"), sun.day(), sun.format("%b %Y"))
+    }
+}
+
+/// (hour, minute, second) from an `added_at` timestamp.
+fn entry_time(added_at: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = added_at.get(11..)?.split(':').map(|p| p.parse::<u32>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+/// The timestamp for an entry moved to `date` (and `hour`, keeping its minutes and seconds).
+fn moved_timestamp(added_at: &str, date: NaiveDate, hour: Option<u32>) -> String {
+    let (h, m, s) = entry_time(added_at).unwrap_or((0, 0, 0));
+    format!("{} {:02}:{:02}:{:02}", key(date), hour.unwrap_or(h).min(23), m, s)
+}
+
+/// One entry on the calendar: a coloured pill that can be clicked, double-clicked (edit) or dragged.
+#[allow(clippy::too_many_arguments)]
+fn pill(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    e: &Entry,
+    cats: &[Category],
+    size: f32,
+    drag: &mut Option<u64>,
+    ev: &mut CalEvents,
+) {
+    let c = category_color(cats, &e.category);
+    let resp = ui.interact(rect, ui.id().with(("pill", e.id)), Sense::click_and_drag());
+    let being_dragged = *drag == Some(e.id);
+    let label = format!("{} {}", e.added_at.get(11..16).unwrap_or(""), markdown::summary(&e.text));
+    let fg = text_on(c);
+
+    painter.rect_filled(rect, 9.0, if being_dragged { c.gamma_multiply(0.3) } else { c });
+    if resp.hovered() && !being_dragged {
+        painter.rect_stroke(rect, 9.0, Stroke::new(1.5, fg), egui::StrokeKind::Inside);
+    }
+    painter.with_clip_rect(rect.shrink2(vec2(4.0, 0.0))).text(
+        egui::pos2(rect.min.x + 7.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        &label,
+        FontId::proportional(size),
+        if being_dragged { fg.gamma_multiply(0.5) } else { fg },
+    );
+    if resp.hovered() || being_dragged {
+        ui.ctx().set_cursor_icon(if being_dragged { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+    }
+
+    if resp.drag_started() {
+        *drag = Some(e.id);
+    }
+    if resp.dragged() && *drag == Some(e.id) {
+        // A copy of the pill follows the pointer.
+        if let Some(pos) = ui.ctx().pointer_latest_pos() {
+            let gp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drag_ghost")));
+            let r = egui::Rect::from_min_size(pos + vec2(12.0, 6.0), vec2(rect.width().min(300.0), rect.height()));
+            gp.rect_filled(r.translate(vec2(2.0, 3.0)), 9.0, Color32::from_black_alpha(80));
+            gp.rect_filled(r, 9.0, c);
+            gp.with_clip_rect(r.shrink2(vec2(4.0, 0.0))).text(
+                egui::pos2(r.min.x + 7.0, r.center().y),
+                Align2::LEFT_CENTER,
+                &label,
+                FontId::proportional(size),
+                fg,
+            );
+        }
+    }
+    if resp.drag_stopped() && drag.take() == Some(e.id) {
+        if let Some(pos) = ui.ctx().pointer_latest_pos() {
+            ev.drop_at = Some((e.id, pos));
+        }
+    }
+    if resp.double_clicked() {
+        ev.edit = Some(e.id);
+    } else if resp.clicked() {
+        ev.select = NaiveDate::parse_from_str(&e.date, "%Y-%m-%d").ok();
+    }
 }

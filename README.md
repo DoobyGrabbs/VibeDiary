@@ -6,7 +6,8 @@ Write down your thoughts each day with rich formatting and pictures, tag them wi
 
 ## Features
 
-- **Month calendar** with each day's entries shown as coloured pills (time + first line of the entry).
+- **Month, Week and Day calendar views.** Each entry is a coloured pill (time + first line). The Day view is an hour-by-hour timeline.
+- **Drag and drop**: drag an entry's pill onto another day to move it (its time is kept). In the Day view, drag it to another hour to change its time. Press Esc to cancel a drag; double-click a pill to edit it.
 - **Multiple entries per day**, each with a time. You can change an entry's date and time when you edit it.
 - **WYSIWYG rich text editor** (Markdown underneath): type in a single page where bold looks bold, headings are large and the Markdown marks disappear. The marks show on the line your cursor is on, or everywhere with "Show formatting marks". A toolbar offers bold, italic, strikethrough, code, three heading sizes, bulleted and numbered lists and quotes; `Ctrl+B` and `Ctrl+I` work too.
 - **Pictures** appear in the page where you put them. Add them with the **Image** button or by dropping a file onto the editor, and remove them with the button under each one. Large images are shrunk (longest side 1600 px) and stored inside the encrypted diary.
@@ -27,7 +28,10 @@ Write down your thoughts each day with rich formatting and pictures, tag them wi
 | Edit or delete an entry | Use the buttons on its card in the day panel |
 | Format text | Select text and use the toolbar buttons or shortcuts (click again to remove the format), or type Markdown such as `**bold**` or `# Heading` |
 | Add a picture | **Image…** in the editor, or drop an image file onto the editor |
-| Change month | **◀** / **▶** in the header, or **Today** to jump back |
+| Switch view | **Month / Week / Day** buttons above the calendar |
+| Move around | **◀** / **▶** step a month, week or day (depending on the view); **Today** jumps back |
+| Move an entry | Drag its pill onto another day (or, in the Day view, another hour) |
+| Edit an entry quickly | Double-click its pill |
 | Search | Type in the search box; clear it to go back to the day view |
 | Manage categories | **Categories** button in the header (press Enter to apply a rename) |
 
