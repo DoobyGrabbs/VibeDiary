@@ -274,7 +274,7 @@ pub fn build_pdf(report: &Report, cats: &[Category], images: &BTreeMap<String, S
             let tint = Color::Rgb((rgb[0] as f32 * 0.6) as u8, (rgb[1] as f32 * 0.6) as u8, (rgb[2] as f32 * 0.6) as u8);
             let mut head = format!("{}   {}", e.added_at.get(11..16).unwrap_or(""), e.category);
             if let Some(m) = e.mood.filter(|m| (1..=5).contains(m)) {
-                head.push_str(&format!("   mood {m}/5"));
+                head.push_str(&format!("   mood: {}", crate::MOOD_LABELS[usize::from(m) - 1]));
             }
             doc.push(Paragraph::new(StyledString::new(head, Style::new().bold().with_font_size(10).with_color(tint))));
             doc.push(Break::new(0.3));

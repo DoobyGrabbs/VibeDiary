@@ -8,6 +8,7 @@ use location::data_path;
 
 mod icon;
 mod export;
+mod faces;
 mod live;
 mod location;
 mod markdown;
@@ -1146,9 +1147,8 @@ impl DiaryApp {
             painter.rect_stroke(rect, 6.0, border, egui::StrokeKind::Inside);
             painter.text(rect.min + vec2(8.0, 6.0), Align2::LEFT_TOP, day.day().to_string(), FontId::proportional(19.0), p.day_num);
             if let Some(m) = day_stats.get(&day).and_then(|s| s.mood()) {
-                let c = egui::pos2(rect.max.x - 14.0, rect.min.y + 15.0);
-                painter.circle_filled(c, 6.5, mood_color(m));
-                painter.circle_stroke(c, 6.5, Stroke::new(1.0, Color32::from_black_alpha(90)));
+                let face = egui::Rect::from_center_size(egui::pos2(rect.max.x - 17.0, rect.min.y + 17.0), vec2(24.0, 24.0));
+                faces::paint(&painter, ui.ctx(), face, m.round() as u8, 1.0);
             }
 
             let entries = &by_day[n];
@@ -1715,20 +1715,12 @@ impl DiaryApp {
                         ui.add_space(10.0);
                         ui.label("Mood:");
                         for m in 1..=5u8 {
-                            let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
-                            let col = mood_color(f32::from(m));
+                            let (r, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
                             let on = ed.mood == Some(m);
-                            ui.painter().circle_filled(r.center(), 11.0, if on { col } else { col.gamma_multiply(0.4) });
                             if on {
-                                ui.painter().circle_stroke(r.center(), 12.5, Stroke::new(2.0, p.ink));
+                                ui.painter().circle_stroke(r.center(), 14.5, Stroke::new(2.5, p.ink));
                             }
-                            ui.painter().text(
-                                r.center(),
-                                Align2::CENTER_CENTER,
-                                m.to_string(),
-                                FontId::proportional(13.0),
-                                if on { text_on(col) } else { p.ink },
-                            );
+                            faces::paint(ui.painter(), ui.ctx(), r.shrink(2.0), m, if on || resp.hovered() { 1.0 } else { 0.5 });
                             let resp = resp.on_hover_text(format!("{} (click again to clear)", MOOD_LABELS[usize::from(m) - 1]));
                             if resp.clicked() {
                                 ed.mood = if on { None } else { Some(m) };
@@ -2811,7 +2803,7 @@ fn current_lock_mode() -> LockMode {
     }
 }
 
-const MOOD_LABELS: [&str; 5] = ["Awful", "Low", "Okay", "Good", "Great"];
+const MOOD_LABELS: [&str; 5] = ["Really sad", "Sad", "Okay", "Happy", "Really happy"];
 
 /// Red (1) through amber to green (5); fractional values blend.
 fn mood_color(value: f32) -> Color32 {
@@ -2824,11 +2816,8 @@ fn mood_color(value: f32) -> Color32 {
 
 /// A small coloured circle holding the mood number.
 fn mood_badge(ui: &mut egui::Ui, mood: u8) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
-    let col = mood_color(f32::from(mood));
-    ui.painter().circle_filled(rect.center(), 9.0, col);
-    ui.painter().circle_stroke(rect.center(), 9.0, Stroke::new(1.0, Color32::from_black_alpha(90)));
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, mood.to_string(), FontId::proportional(12.0), text_on(col));
+    let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+    faces::paint(ui.painter(), ui.ctx(), rect, mood, 1.0);
     resp.on_hover_text(format!("Mood: {}", MOOD_LABELS[usize::from(mood.clamp(1, 5)) - 1]));
 }
 

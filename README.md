@@ -7,7 +7,7 @@ Write down your thoughts each day with rich formatting and pictures, tag them wi
 ## Features
 
 **Calendar**
-- **Day, Week, Month and Year views.** In Day, Week and Month each entry is a coloured pill (time + first line); the Day view is an hour-by-hour timeline. A small coloured dot on a day shows its average mood.
+- **Day, Week, Month and Year views.** In Day, Week and Month each entry is a coloured pill (time + first line); the Day view is an hour-by-hour timeline. A small face on a day shows its average mood.
 - **Year view**: a heat-map of the days you wrote (shade = words written), plus entries, days written, words, current and longest streak, average mood, entries per category and a chart of your mood through the year.
 - **Drag and drop**: drag an entry's pill onto another day to move it (its time is kept). In the Day view, drag it to another hour to change its time. Press Esc to cancel a drag; double-click a pill to edit it.
 - **On this day**: the day panel lists what you wrote on the same date in earlier years; click one to jump to it.
@@ -16,7 +16,7 @@ Write down your thoughts each day with rich formatting and pictures, tag them wi
 **Writing**
 - **WYSIWYG rich text editor** (Markdown underneath): type in a single page where bold looks bold, headings are large and the Markdown marks disappear. The marks show on the line your cursor is on, or everywhere with "Show formatting marks". A toolbar offers bold, italic, strikethrough, code, three heading sizes, bulleted and numbered lists and quotes.
 - **Pictures** appear in the page where you put them. Add them with the **Image** button or by dropping a file onto the editor, and remove them with the button under each one. Large images are shrunk (longest side 1600 px) and stored inside the encrypted diary.
-- **Mood**: rate each entry from 1 (awful) to 5 (great) with the Mood buttons.
+- **Mood**: rate each entry with five emoji-style faces, from really sad (red, crying) to really happy (green, grinning). Click a face again to clear it. The scale is stored as 1 to 5.
 - **Word count and daily goal**: the editor shows a live word count. Pick a daily goal under **Settings → Daily word goal** and a progress bar tracks the day's total in the editor and the day panel.
 - **Multiple entries per day**, each with a time and a category. You can change an entry's date and time when you edit it.
 - **Categories** with their own colours. Add, rename, recolour and delete them from the Categories window. Renaming a category updates the entries that use it.
