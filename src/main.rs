@@ -590,11 +590,13 @@ impl DiaryApp {
                     .desired_width(190.0),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Lock").clicked() {
-                    self.lock_now();
-                }
+                // Settings cog: the last item in the header.
+                let (rect, cog) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
+                let cog = cog.on_hover_text("Settings");
+                ui.painter().rect_filled(rect, 8.0, if cog.hovered() || cog.is_pointer_button_down_on() { BLUE_HOVER } else { BLUE });
+                paint_cog(ui.painter(), rect.center(), 11.0, Color32::WHITE, if cog.hovered() { BLUE_HOVER } else { BLUE });
                 let mut settings_changed = false;
-                ui.menu_button("Menu", |ui| {
+                egui::Popup::menu(&cog).show(|ui| {
                     if ui.button("Change password…").clicked() {
                         self.show_password = true;
                         ui.close();
@@ -611,6 +613,9 @@ impl DiaryApp {
                 });
                 if settings_changed {
                     self.persist();
+                }
+                if ui.button("Lock").clicked() {
+                    self.lock_now();
                 }
                 if ui.button("🎨 Categories").clicked() {
                     self.show_categories = true;
@@ -1661,4 +1666,21 @@ fn insert_image(ctx: &egui::Context, ed: &mut EditState, md: &str) {
     segs.splice(idx..=idx, [live::Seg::Text(before), picture, live::Seg::Text(after)]);
     ed.text = live::join(&segs);
     ed.want_focus = Some((idx + 2, 0));
+}
+
+/// A gear: eight teeth around a disc with a hole in the middle.
+fn paint_cog(painter: &egui::Painter, center: egui::Pos2, r: f32, color: Color32, hole: Color32) {
+    const TEETH: usize = 8;
+    for k in 0..TEETH {
+        let (s, c) = (k as f32 * std::f32::consts::TAU / TEETH as f32).sin_cos();
+        let (dir, side) = (vec2(c, s), vec2(-s, c) * (r * 0.22));
+        let (inner, outer) = (center + dir * (r * 0.6), center + dir * r);
+        painter.add(egui::Shape::convex_polygon(
+            vec![inner + side, outer + side, outer - side, inner - side],
+            color,
+            Stroke::NONE,
+        ));
+    }
+    painter.circle_filled(center, r * 0.74, color);
+    painter.circle_filled(center, r * 0.32, hole);
 }

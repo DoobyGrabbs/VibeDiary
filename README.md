@@ -12,9 +12,9 @@ Write down your thoughts each day with rich formatting and pictures, tag them wi
 - **Pictures** appear in the page where you put them. Add them with the **Image** button or by dropping a file onto the editor, and remove them with the button under each one. Large images are shrunk (longest side 1600 px) and stored inside the encrypted diary.
 - **Categories** with their own colours. Add, rename, recolour and delete them from the Categories window. Renaming a category updates the entries that use it.
 - **Search** across all entries from the box in the header; click a result to jump to its day.
-- **Password protection.** The diary is encrypted with a password you choose, and the app asks for it every time it starts. **Lock** locks it immediately; **Menu → Change password** changes it.
-- **Auto-lock** after a period of inactivity (default 10 minutes; change or turn off under **Menu → Auto-lock**). An entry you're in the middle of writing survives locking.
-- **Backup**: **Menu → Back up encrypted copy** saves a copy of the encrypted file wherever you like.
+- **Password protection.** The diary is encrypted with a password you choose, and the app asks for it every time it starts. **Lock** locks it immediately; **Settings (cog) → Change password** changes it.
+- **Auto-lock** after a period of inactivity (default 10 minutes; change or turn off under **Settings → Auto-lock**). An entry you're in the middle of writing survives locking.
+- **Backup**: **Settings → Back up encrypted copy** saves a copy of the encrypted file wherever you like.
 - **Popup windows** for creating and editing entries and for managing categories; they are draggable and resizable.
 - **Light and dark mode** that follow your Windows system setting.
 
