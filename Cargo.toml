@@ -10,9 +10,11 @@ chacha20poly1305 = "0.11.0"
 chrono = "0.4.45"
 eframe = "0.36.2"
 egui_extras = { version = "0.36.2", features = ["datepicker"] }
+genpdf = { version = "0.2.0", features = ["images"] }
 getrandom = "0.4.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 jiff = "0.2.38"
+lopdf = "0.26"
 pulldown-cmark = "0.13.4"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }

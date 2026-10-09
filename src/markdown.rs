@@ -19,23 +19,23 @@ pub const IMAGE_SCHEME: &str = "img:";
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
-struct Fmt {
-    bold: bool,
-    italic: bool,
-    strike: bool,
-    code: bool,
-    link: bool,
+pub(crate) struct Fmt {
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) strike: bool,
+    pub(crate) code: bool,
+    pub(crate) link: bool,
 }
 
 #[derive(Clone, PartialEq, Debug)]
-enum Inline {
+pub(crate) enum Inline {
     Text(String, Fmt),
     Break,
     Image { src: String, alt: String },
 }
 
 #[derive(Clone, PartialEq, Debug)]
-enum Block {
+pub(crate) enum Block {
     Para(Vec<Inline>),
     Heading(u8, Vec<Inline>),
     Quote(Vec<Block>),
@@ -204,7 +204,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn parse(md: &str) -> Vec<Block> {
+pub(crate) fn parse(md: &str) -> Vec<Block> {
     let events: Vec<Event> = Parser::new_ext(md, Options::ENABLE_STRIKETHROUGH).collect();
     Cursor { events, i: 0 }.blocks()
 }
@@ -614,5 +614,34 @@ pub fn show_image(
         None => {
             ui.add(Label::new(egui::RichText::new(format!("[missing image: {alt}]")).color(text)));
         }
+    }
+}
+
+/// Number of words in an entry, ignoring Markdown marks and picture names.
+pub fn word_count(md: &str) -> usize {
+    let mut words = 0;
+    let mut in_image = false;
+    for event in Parser::new(md) {
+        match event {
+            Event::Start(Tag::Image { .. }) => in_image = true,
+            Event::End(TagEnd::Image) => in_image = false,
+            Event::Text(t) | Event::Code(t) if !in_image => words += t.split_whitespace().count(),
+            _ => {}
+        }
+    }
+    words
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::word_count;
+
+    #[test]
+    fn counts_words_not_marks_or_picture_names() {
+        assert_eq!(word_count(""), 0);
+        assert_eq!(word_count("one two  three"), 3);
+        assert_eq!(word_count("# Title\n\n**bold** words and `code`\n\n- a\n- b"), 7);
+        assert_eq!(word_count("![a long picture name](img:i1)\n\nafter"), 1);
+        assert_eq!(word_count("line one\nline two"), 4);
     }
 }

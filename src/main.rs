@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use chrono::{Datelike, Local, NaiveDate, Timelike};
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke, vec2};
 use serde::{Deserialize, Serialize};
 
+use location::data_path;
+
 mod icon;
+mod export;
 mod live;
+mod location;
 mod markdown;
+mod stats;
 mod vault;
 
 const BLUE: Color32 = Color32::from_rgb(37, 99, 235);
@@ -90,6 +94,9 @@ struct Entry {
     added_at: String,
     category: String,
     text: String,
+    /// How the day felt, 1 (awful) to 5 (great).
+    #[serde(default)]
+    mood: Option<u8>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -104,14 +111,17 @@ struct Data {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 struct Settings {
     /// Lock after this many idle minutes; 0 turns auto-lock off.
     auto_lock_minutes: u32,
+    /// Daily writing goal in words; 0 means no goal.
+    daily_word_goal: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { auto_lock_minutes: 10 }
+        Self { auto_lock_minutes: 10, daily_word_goal: 0 }
     }
 }
 
@@ -128,10 +138,6 @@ fn default_categories() -> Vec<Category> {
     .collect()
 }
 
-fn data_path() -> PathBuf {
-    // Project folder, fixed at compile time so it doesn't depend on the working directory.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("entries.json")
-}
 
 fn fresh_data() -> Data {
     Data { categories: default_categories(), entries: Vec::new(), images: BTreeMap::new(), settings: Settings::default() }
@@ -174,6 +180,7 @@ fn inspect() -> Disk {
                 date,
                 category: category.clone(),
                 text,
+                mood: None,
             })
             .collect();
         return Disk::Plain(data);
@@ -221,6 +228,7 @@ struct EditState {
     second: u32,
     category: String,
     text: String,
+    mood: Option<u8>,
     /// Index of the text block that last had the cursor (target of toolbar actions).
     focus: usize,
     /// Move the cursor here next frame: (text block index, char position); `usize::MAX` = last / end.
@@ -282,6 +290,16 @@ struct DiaryApp {
     /// Category row being renamed and its in-progress text.
     rename_buf: Option<(usize, String)>,
     show_password: bool,
+    show_location: bool,
+    show_shortcuts: bool,
+    show_export: bool,
+    export_scope: ExportScope,
+    export_images: bool,
+    export_msg: String,
+    export_path: Option<std::path::PathBuf>,
+    /// Ctrl+S was pressed while writing an entry.
+    save_requested: bool,
+    location_msg: String,
     pw_new: String,
     pw_confirm: String,
     pw_error: String,
@@ -289,6 +307,9 @@ struct DiaryApp {
     media: markdown::Media,
     show_marks: bool,
     view: CalView,
+    /// Bumped whenever the diary changes; invalidates `stats_cache`.
+    rev: u64,
+    stats_cache: Option<(u64, BTreeMap<NaiveDate, stats::DayStat>)>,
     /// Entry being dragged on the calendar.
     drag: Option<u64>,
     /// Scroll the day view to the working hours on its next frame.
@@ -304,12 +325,7 @@ struct DiaryApp {
 impl DiaryApp {
     fn new() -> Self {
         let today = Local::now().date_naive();
-        let mode = match inspect() {
-            Disk::Missing => LockMode::Create,
-            Disk::Encrypted(env) => LockMode::Unlock(env),
-            Disk::Plain(data) => LockMode::Encrypt(data),
-            Disk::Unreadable(why) => LockMode::Broken(why),
-        };
+        let mode = current_lock_mode();
         Self {
             data: fresh_data(),
             vault: None,
@@ -322,6 +338,15 @@ impl DiaryApp {
             new_cat_color: [59, 130, 246],
             rename_buf: None,
             show_password: false,
+            show_location: false,
+            show_shortcuts: false,
+            show_export: false,
+            export_scope: ExportScope::Month,
+            export_images: true,
+            export_msg: String::new(),
+            export_path: None,
+            save_requested: false,
+            location_msg: String::new(),
             pw_new: String::new(),
             pw_confirm: String::new(),
             pw_error: String::new(),
@@ -329,6 +354,8 @@ impl DiaryApp {
             media: markdown::Media::default(),
             show_marks: false,
             view: CalView::Month,
+            rev: 0,
+            stats_cache: None,
             drag: None,
             day_scroll_pending: true,
             search: String::new(),
@@ -339,6 +366,7 @@ impl DiaryApp {
     }
 
     fn persist(&mut self) {
+        self.rev += 1;
         self.drop_unused_images();
         self.status = match &self.vault {
             Some(v) => match save(&self.data, v) {
@@ -378,6 +406,7 @@ impl DiaryApp {
             Ok((v, data)) => {
                 self.vault = Some(v);
                 self.data = data;
+                self.rev += 1;
                 self.data.images.extend(std::mem::take(&mut self.draft_images));
                 self.last_activity = std::time::Instant::now();
                 self.lock = None;
@@ -394,10 +423,7 @@ impl DiaryApp {
 
     /// Forget the key and the decrypted data and go back to the lock screen.
     fn lock_now(&mut self) {
-        let mode = match inspect() {
-            Disk::Encrypted(env) => LockMode::Unlock(env),
-            _ => LockMode::Broken("the diary file changed unexpectedly".into()),
-        };
+        let mode = current_lock_mode();
         // An open draft survives locking (it only exists in memory), along with its images.
         self.draft_images = match &self.editor {
             Some(ed) => markdown::image_ids(&ed.text)
@@ -409,9 +435,13 @@ impl DiaryApp {
         self.data = fresh_data();
         self.vault = None;
         self.media = markdown::Media::default();
+        self.stats_cache = None;
         self.search.clear();
         self.show_categories = false;
         self.show_password = false;
+        self.show_location = false;
+        self.show_export = false;
+        self.show_shortcuts = false;
         self.lock = Some(Lock::new(mode));
     }
 
@@ -539,6 +569,76 @@ impl DiaryApp {
     }
 
 
+    fn location_window(&mut self, ctx: &egui::Context) {
+        if !self.show_location {
+            return;
+        }
+        let p = palette(ctx);
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let mut close = false;
+        let (mut reveal, mut move_it, mut use_other) = (false, false, false);
+
+        egui::Window::new("Data location")
+            .title_bar(false)
+            .frame(popup_frame(&p, dark))
+            .resizable(false)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                close |= popup_header(ui, &p, "Data location");
+                egui::Frame::new().inner_margin(14).show(ui, |ui| {
+                    ui.set_width(480.0);
+                    ui.label("Your diary (always encrypted) is stored in this folder:");
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(RichText::new(location::data_dir().display().to_string()).monospace().color(p.ink)).wrap());
+                    ui.add_space(6.0);
+                    reveal = ui.button("Show in Explorer").clicked();
+                    ui.separator();
+                    ui.label(RichText::new("Move it somewhere else").strong().color(p.title));
+                    ui.label(RichText::new("Copies the diary to a folder you choose and uses it from there.").color(p.muted));
+                    move_it = ui.button("Move diary to another folder…").clicked();
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Open a different diary").strong().color(p.title));
+                    ui.label(RichText::new("Use a diary that already exists in another folder, such as a backup. You will be asked for its password.").color(p.muted));
+                    use_other = ui.button("Use a diary from another folder…").clicked();
+                    if !self.location_msg.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(&self.location_msg).color(p.ink));
+                    }
+                });
+            });
+
+        if reveal {
+            std::process::Command::new("explorer").arg(location::data_dir()).spawn().ok();
+        }
+        if move_it {
+            if let Some(dir) = rfd::FileDialog::new().set_directory(location::data_dir()).pick_folder() {
+                self.location_msg = match location::move_to(dir) {
+                    Ok(()) => format!("Moved. The diary is now in {}", location::data_dir().display()),
+                    Err(e) => e,
+                };
+            }
+        }
+        if use_other {
+            if let Some(dir) = rfd::FileDialog::new().set_directory(location::data_dir()).pick_folder() {
+                match location::use_existing(dir) {
+                    Ok(()) => {
+                        // Back to the lock screen, now pointing at the other diary.
+                        self.editor = None;
+                        self.location_msg.clear();
+                        self.show_location = false;
+                        self.lock_now();
+                    }
+                    Err(e) => self.location_msg = e,
+                }
+            }
+        }
+        if close {
+            self.show_location = false;
+            self.location_msg.clear();
+        }
+    }
+
     fn day_entries(&self, d: NaiveDate) -> Vec<&Entry> {
         let k = key(d);
         let mut v: Vec<&Entry> = self.data.entries.iter().filter(|e| e.date == k).collect();
@@ -571,10 +671,248 @@ impl DiaryApp {
             second,
             category,
             text: String::new(),
+            mood: None,
             focus: 0,
             want_focus: Some((usize::MAX, usize::MAX)),
         });
         self.editor_msg.clear();
+    }
+
+    /// Step the calendar one month / week / day / year.
+    fn step_calendar(&mut self, dir: i64) {
+        match self.view {
+            CalView::Month => self.shift_month(dir as i32),
+            CalView::Week => self.shift_days(7 * dir),
+            CalView::Day => self.shift_days(dir),
+            CalView::Year => self.shift_year(dir as i32),
+        }
+    }
+
+    fn go_today(&mut self) {
+        let t = Local::now().date_naive();
+        self.selected = t;
+        self.month = t.with_day(1).unwrap();
+        self.day_scroll_pending = true;
+        self.search.clear();
+    }
+
+    /// Keyboard shortcuts (listed in the "Keyboard shortcuts" window).
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, Modifiers};
+        if self.lock.is_some() {
+            return;
+        }
+        let cmd = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, key));
+        let editing = self.editor.is_some();
+
+        if cmd(Key::L) {
+            self.lock_now();
+            return;
+        }
+        if editing {
+            // Ctrl+S saves the entry being written.
+            if cmd(Key::S) || cmd(Key::Enter) {
+                self.save_requested = true;
+            }
+            return;
+        }
+        if cmd(Key::N) {
+            self.new_entry(self.selected);
+        }
+        if cmd(Key::F) {
+            ctx.memory_mut(|m| m.request_focus(search_id()));
+        }
+        if cmd(Key::E) {
+            self.show_export = true;
+        }
+        if cmd(Key::T) {
+            self.go_today();
+        }
+        for (key, view) in [(Key::Num1, CalView::Day), (Key::Num2, CalView::Week), (Key::Num3, CalView::Month), (Key::Num4, CalView::Year)] {
+            if cmd(key) {
+                self.view = view;
+                self.day_scroll_pending = true;
+            }
+        }
+        // Arrow keys move through time, unless a text box wants them.
+        if !ctx.egui_wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(Key::ArrowLeft)) {
+                self.step_calendar(-1);
+            }
+            if ctx.input(|i| i.key_pressed(Key::ArrowRight)) {
+                self.step_calendar(1);
+            }
+        }
+    }
+
+    /// First day, last day, a description and a file-name part for an export scope.
+    fn export_range(&self, scope: ExportScope) -> (NaiveDate, NaiveDate, String, String) {
+        let d = self.selected;
+        match scope {
+            ExportScope::Day => (d, d, d.format("%A %e %B %Y").to_string(), key(d)),
+            ExportScope::Week => {
+                let monday = week_start(d);
+                (monday, monday + chrono::Days::new(6), week_title(d), format!("week-{}", key(monday)))
+            }
+            ExportScope::Month => {
+                let first = d.with_day(1).unwrap();
+                let last = self.shift_target(first).pred_opt().unwrap();
+                (first, last, d.format("%B %Y").to_string(), d.format("%Y-%m").to_string())
+            }
+            ExportScope::Year => {
+                let (first, last) = (NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap(), NaiveDate::from_ymd_opt(d.year(), 12, 31).unwrap());
+                (first, last, d.year().to_string(), d.year().to_string())
+            }
+            ExportScope::All => (NaiveDate::from_ymd_opt(1, 1, 1).unwrap(), NaiveDate::from_ymd_opt(9999, 12, 31).unwrap(), "Everything".into(), "all".into()),
+        }
+    }
+
+    fn entries_in(&self, from: NaiveDate, to: NaiveDate) -> Vec<&Entry> {
+        let (from, to) = (key(from), key(to));
+        self.data.entries.iter().filter(|e| e.date >= from && e.date <= to).collect()
+    }
+
+    fn export_window(&mut self, ctx: &egui::Context) {
+        if !self.show_export {
+            return;
+        }
+        let p = palette(ctx);
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let mut close = false;
+        let mut create = false;
+        let mut open_file = false;
+        let scopes = [
+            (ExportScope::Day, "This day"),
+            (ExportScope::Week, "This week"),
+            (ExportScope::Month, "This month"),
+            (ExportScope::Year, "This year"),
+            (ExportScope::All, "Everything"),
+        ];
+        let choices: Vec<(ExportScope, String)> = scopes
+            .iter()
+            .map(|(scope, name)| {
+                let (from, to, what, _) = self.export_range(*scope);
+                let n = self.entries_in(from, to).len();
+                let what = if *scope == ExportScope::All { String::new() } else { format!(" – {what}") };
+                (*scope, format!("{name}{what}  ({n} {})", if n == 1 { "entry" } else { "entries" }))
+            })
+            .collect();
+
+        egui::Window::new("Export to PDF")
+            .title_bar(false)
+            .frame(popup_frame(&p, dark))
+            .resizable(false)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                close |= popup_header(ui, &p, "Export to PDF");
+                egui::Frame::new().inner_margin(14).show(ui, |ui| {
+                    ui.set_width(460.0);
+                    ui.label(RichText::new("What to include").strong().color(p.title));
+                    ui.add_space(4.0);
+                    for (scope, label) in &choices {
+                        ui.radio_value(&mut self.export_scope, *scope, label);
+                    }
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut self.export_images, "Include pictures");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("The PDF is a plain copy of your entries. It is not encrypted or password protected, so keep it somewhere safe.").small().color(p.muted));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        create = ui.button("Create PDF…").clicked();
+                        if self.export_path.is_some() {
+                            open_file = ui.button("Open last PDF").clicked();
+                        }
+                    });
+                    if !self.export_msg.is_empty() {
+                        ui.add_space(8.0);
+                        ui.add(egui::Label::new(RichText::new(&self.export_msg).color(p.ink)).wrap());
+                    }
+                });
+            });
+
+        if create {
+            let (from, to, what, slug) = self.export_range(self.export_scope);
+            let entries = self.entries_in(from, to);
+            let name = format!("diary-{slug}.pdf");
+            let dest = rfd::FileDialog::new().set_file_name(name).add_filter("PDF document", &["pdf"]).save_file();
+            if let Some(dest) = dest {
+                let report = export::Report {
+                    title: "My Diary".into(),
+                    subtitle: format!(
+                        "{what} · {} {} · created {}",
+                        entries.len(),
+                        if entries.len() == 1 { "entry" } else { "entries" },
+                        Local::now().format("%e %B %Y")
+                    ),
+                    entries,
+                    include_images: self.export_images,
+                };
+                self.export_msg = match export::build_pdf(&report, &self.data.categories, &self.data.images)
+                    .and_then(|bytes| std::fs::write(&dest, bytes).map_err(|e| format!("Couldn't save the PDF: {e}")))
+                {
+                    Ok(()) => {
+                        self.export_path = Some(dest.clone());
+                        format!("Saved {}", dest.display())
+                    }
+                    Err(e) => e,
+                };
+            }
+        }
+        if open_file {
+            if let Some(path) = &self.export_path {
+                std::process::Command::new("cmd").args(["/C", "start", ""]).arg(path).spawn().ok();
+            }
+        }
+        if close {
+            self.show_export = false;
+        }
+    }
+
+    fn shortcuts_window(&mut self, ctx: &egui::Context) {
+        if !self.show_shortcuts {
+            return;
+        }
+        let p = palette(ctx);
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let mut close = false;
+        egui::Window::new("Keyboard shortcuts")
+            .title_bar(false)
+            .frame(popup_frame(&p, dark))
+            .resizable(false)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                close |= popup_header(ui, &p, "Keyboard shortcuts");
+                egui::Frame::new().inner_margin(14).show(ui, |ui| {
+                    let rows: [(&str, &str); 14] = [
+                        ("Ctrl+N", "New entry on the selected day"),
+                        ("Ctrl+F", "Search entries"),
+                        ("Ctrl+T", "Jump to today"),
+                        ("Ctrl+L", "Lock the diary"),
+                        ("Ctrl+E", "Export entries to PDF"),
+                        ("← / →", "Previous / next month, week, day or year"),
+                        ("Ctrl+1 … 4", "Day, Week, Month, Year view"),
+                        ("Double-click", "A day: new entry. An entry: edit it"),
+                        ("Drag", "Move an entry to another day or hour"),
+                        ("Esc", "Cancel a drag"),
+                        ("Ctrl+S", "Save the entry (while writing)"),
+                        ("Ctrl+Enter", "Save the entry (while writing)"),
+                        ("Ctrl+B / Ctrl+I", "Bold / italic (while writing)"),
+                        ("Click again", "A mood button or toolbar format removes it"),
+                    ];
+                    egui::Grid::new("shortcut_grid").num_columns(2).spacing([24.0, 8.0]).show(ui, |ui| {
+                        for (keys, what) in rows {
+                            ui.label(RichText::new(keys).strong().monospace().color(p.title));
+                            ui.label(RichText::new(what).color(p.ink));
+                            ui.end_row();
+                        }
+                    });
+                });
+            });
+        if close {
+            self.show_shortcuts = false;
+        }
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
@@ -585,7 +923,8 @@ impl DiaryApp {
             ui.add_space(8.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search entries")
+                    .id(search_id())
+                    .hint_text("Search entries (Ctrl+F)")
                     .text_color(p.ink)
                     .margin(egui::Margin::symmetric(8, 5))
                     .desired_width(190.0),
@@ -602,10 +941,27 @@ impl DiaryApp {
                         self.show_password = true;
                         ui.close();
                     }
+                    if ui.button("Keyboard shortcuts…").clicked() {
+                        self.show_shortcuts = true;
+                        ui.close();
+                    }
+                    if ui.button("Export to PDF…").clicked() {
+                        self.show_export = true;
+                        ui.close();
+                    }
+                    if ui.button("Data location…").clicked() {
+                        self.show_location = true;
+                        ui.close();
+                    }
                     if ui.button("Back up encrypted copy…").clicked() {
                         self.backup();
                         ui.close();
                     }
+                    ui.menu_button("Daily word goal", |ui| {
+                        for (label, words) in [("Off", 0), ("100 words", 100), ("250 words", 250), ("500 words", 500), ("750 words", 750), ("1,000 words", 1000)] {
+                            settings_changed |= ui.radio_value(&mut self.data.settings.daily_word_goal, words, label).changed();
+                        }
+                    });
                     ui.menu_button("Auto-lock", |ui| {
                         for (label, mins) in [("Off", 0), ("After 1 minute", 1), ("After 5 minutes", 5), ("After 10 minutes", 10), ("After 30 minutes", 30)] {
                             settings_changed |= ui.radio_value(&mut self.data.settings.auto_lock_minutes, mins, label).changed();
@@ -615,13 +971,13 @@ impl DiaryApp {
                 if settings_changed {
                     self.persist();
                 }
-                if ui.button("Lock").clicked() {
+                if ui.button("Lock").on_hover_text("Lock the diary (Ctrl+L)").clicked() {
                     self.lock_now();
                 }
                 if ui.button("🎨 Categories").clicked() {
                     self.show_categories = true;
                 }
-                if ui.button("➕ New entry").clicked() {
+                if ui.button("➕ New entry").on_hover_text("New entry (Ctrl+N)").clicked() {
                     self.new_entry(self.selected);
                 }
             });
@@ -645,29 +1001,20 @@ impl DiaryApp {
         let p = palette(ui.ctx());
         ui.horizontal(|ui| {
             ui.spacing_mut().interact_size.y = 34.0;
-            let step = |app: &mut Self, dir: i64| match app.view {
-                CalView::Month => app.shift_month(dir as i32),
-                CalView::Week => app.shift_days(7 * dir),
-                CalView::Day => app.shift_days(dir),
-            };
             if ui.button("◀").clicked() {
-                step(self, -1);
+                self.step_calendar(-1);
             }
             if ui.button("▶").clicked() {
-                step(self, 1);
+                self.step_calendar(1);
             }
             ui.add_space(6.0);
             ui.label(RichText::new(self.calendar_title()).size(24.0).strong().color(p.title));
             ui.add_space(6.0);
-            if ui.button("Today").clicked() {
-                let t = Local::now().date_naive();
-                self.selected = t;
-                self.month = t.with_day(1).unwrap();
-                self.day_scroll_pending = true;
-                self.search.clear();
+            if ui.button("Today").on_hover_text("Jump to today (Ctrl+T)").clicked() {
+                self.go_today();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for (view, label) in [(CalView::Day, "Day"), (CalView::Week, "Week"), (CalView::Month, "Month")] {
+                for (view, label) in [(CalView::Day, "Day"), (CalView::Week, "Week"), (CalView::Month, "Month"), (CalView::Year, "Year")] {
                     let selected = self.view == view;
                     let mut button = egui::Button::new(RichText::new(label).strong().color(Color32::WHITE));
                     if selected {
@@ -687,6 +1034,7 @@ impl DiaryApp {
             CalView::Month => self.month.format("%B %Y").to_string(),
             CalView::Week => week_title(self.selected),
             CalView::Day => self.selected.format("%A %e %B %Y").to_string(),
+            CalView::Year => self.selected.year().to_string(),
         }
     }
 
@@ -721,6 +1069,7 @@ impl DiaryApp {
                 self.grid_view(ui, &mut ev, &days, 0, 28.0);
             }
             CalView::Day => self.day_timeline(ui, &mut ev),
+            CalView::Year => self.year_view(ui, &mut ev),
         }
 
         // Escape cancels a drag in progress.
@@ -763,10 +1112,13 @@ impl DiaryApp {
             painter.text(r.center(), Align2::CENTER_CENTER, *name, FontId::proportional(16.0), p.head_text);
         }
 
+        self.ensure_stats();
+        self.ensure_stats();
         let by_day: Vec<Vec<Entry>> = days.iter().map(|d| self.day_entries(*d).into_iter().cloned().collect()).collect();
         let cats = &self.data.categories;
         let drag = &mut self.drag;
         let selected = self.selected;
+        let day_stats = &self.stats_cache.as_ref().unwrap().1;
         let mut cells: Vec<(egui::Rect, NaiveDate)> = Vec::new();
 
         for (n, day) in days.iter().copied().enumerate() {
@@ -793,6 +1145,11 @@ impl DiaryApp {
             let border = if day == selected { Stroke::new(2.5, p.accent) } else { Stroke::new(1.0, p.cell_border) };
             painter.rect_stroke(rect, 6.0, border, egui::StrokeKind::Inside);
             painter.text(rect.min + vec2(8.0, 6.0), Align2::LEFT_TOP, day.day().to_string(), FontId::proportional(19.0), p.day_num);
+            if let Some(m) = day_stats.get(&day).and_then(|s| s.mood()) {
+                let c = egui::pos2(rect.max.x - 14.0, rect.min.y + 15.0);
+                painter.circle_filled(c, 6.5, mood_color(m));
+                painter.circle_stroke(c, 6.5, Stroke::new(1.0, Color32::from_black_alpha(90)));
+            }
 
             let entries = &by_day[n];
             let top = rect.min.y + 30.0;
@@ -905,6 +1262,165 @@ impl DiaryApp {
         }
     }
 
+    fn shift_year(&mut self, delta: i32) {
+        let year = self.selected.year() + delta;
+        // 29 February maps to 28 February in a non-leap year.
+        let moved = NaiveDate::from_ymd_opt(year, self.selected.month(), self.selected.day())
+            .or_else(|| NaiveDate::from_ymd_opt(year, self.selected.month(), 28));
+        if let Some(d) = moved {
+            self.selected = d;
+            self.month = d.with_day(1).unwrap();
+        }
+    }
+
+    /// Recompute the per-day totals if the diary has changed since they were last worked out.
+    fn ensure_stats(&mut self) {
+        if self.stats_cache.as_ref().map(|c| c.0) != Some(self.rev) {
+            self.stats_cache = Some((self.rev, stats::per_day(&self.data.entries)));
+        }
+    }
+
+    /// Year view: a GitHub-style heat-map of the days written, plus totals, categories and mood.
+    fn year_view(&mut self, ui: &mut egui::Ui, ev: &mut CalEvents) {
+        self.ensure_stats();
+        let p = palette(ui.ctx());
+        let dark = ui.ctx().theme() == egui::Theme::Dark;
+        let year = self.selected.year();
+        let today = Local::now().date_naive();
+        let goal = self.data.settings.daily_word_goal;
+        let (jan1, dec31) = (NaiveDate::from_ymd_opt(year, 1, 1).unwrap(), NaiveDate::from_ymd_opt(year, 12, 31).unwrap());
+        let days = &self.stats_cache.as_ref().unwrap().1;
+        let summary = stats::summarise(&self.data.entries, days, jan1, dec31, today, goal);
+        let series = stats::mood_series(days, jan1, dec31);
+        let cats = &self.data.categories;
+        let selected = self.selected;
+        let mut open_day = None;
+
+        egui::ScrollArea::vertical().id_salt("year_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            // ---- heat-map: one column per week, one row per weekday
+            let (label_w, gap, top_h) = (38.0, 3.0, 22.0);
+            let start = week_start(jan1);
+            let weeks = ((week_start(dec31) - start).num_days() / 7 + 1) as f32;
+            let cell = ((ui.available_width() - label_w - gap * weeks) / weeks).clamp(8.0, 24.0);
+            let (rect, _) = ui.allocate_exact_size(vec2(label_w + weeks * (cell + gap), top_h + 7.0 * (cell + gap)), Sense::hover());
+            let painter = ui.painter_at(rect);
+            let cell_pos = |day: NaiveDate| {
+                let col = ((week_start(day) - start).num_days() / 7) as f32;
+                let row = day.weekday().num_days_from_monday() as f32;
+                rect.min + vec2(label_w + col * (cell + gap), top_h + row * (cell + gap))
+            };
+            for m in 1..=12 {
+                let first = NaiveDate::from_ymd_opt(year, m, 1).unwrap();
+                painter.text(
+                    egui::pos2(cell_pos(first).x, rect.min.y),
+                    Align2::LEFT_TOP,
+                    first.format("%b").to_string(),
+                    FontId::proportional(14.0),
+                    p.muted,
+                );
+            }
+            for (row, name) in [(0.0, "Mon"), (2.0, "Wed"), (4.0, "Fri")] {
+                painter.text(
+                    egui::pos2(rect.min.x, rect.min.y + top_h + row * (cell + gap)),
+                    Align2::LEFT_TOP,
+                    name,
+                    FontId::proportional(12.0),
+                    p.muted,
+                );
+            }
+            for n in 0..=(dec31 - jan1).num_days() {
+                let day = jan1 + chrono::Days::new(n as u64);
+                let r = egui::Rect::from_min_size(cell_pos(day), vec2(cell, cell));
+                let stat = days.get(&day);
+                painter.rect_filled(r, 3.0, heat_color(stats::heat_level(stat), dark));
+                if day == today {
+                    painter.rect_stroke(r, 3.0, Stroke::new(2.0, p.accent), egui::StrokeKind::Outside);
+                }
+                if day == selected {
+                    painter.rect_stroke(r, 3.0, Stroke::new(2.0, p.day_num), egui::StrokeKind::Outside);
+                }
+                let resp = ui.interact(r, ui.id().with(("heat", day)), Sense::click());
+                let resp = resp.on_hover_ui(|ui| {
+                    let (n, w) = stat.map_or((0, 0), |s| (s.entries, s.words));
+                    ui.label(RichText::new(day.format("%A %e %B %Y").to_string()).strong());
+                    ui.label(format!("{n} {} · {w} words", if n == 1 { "entry" } else { "entries" }));
+                });
+                if resp.double_clicked() {
+                    open_day = Some(day);
+                } else if resp.clicked() {
+                    ev.select = Some(day);
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Less").small().color(p.muted));
+                for level in 0..=4u8 {
+                    let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                    ui.painter().rect_filled(r, 3.0, heat_color(level, dark));
+                }
+                ui.label(RichText::new("More  ·  shade shows words written that day. Click a day to select it, double-click to open it.").small().color(p.muted));
+            });
+
+            // ---- totals
+            ui.add_space(14.0);
+            ui.label(RichText::new(format!("{year} in numbers")).size(20.0).strong().color(p.title));
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                let mut tile = |label: &str, value: String| {
+                    egui::Frame::new().fill(p.cell).stroke(Stroke::new(1.0, p.cell_border)).corner_radius(8).inner_margin(12).show(ui, |ui| {
+                        ui.set_min_width(110.0);
+                        ui.label(RichText::new(value).size(28.0).strong().color(p.title));
+                        ui.label(RichText::new(label).color(p.muted));
+                    });
+                };
+                tile("entries", summary.entries.to_string());
+                tile("days written", summary.days_written.to_string());
+                tile("words", summary.words.to_string());
+                tile("day streak now", summary.current_streak.to_string());
+                tile("longest streak", summary.longest_streak.to_string());
+                tile("average mood", summary.mood_avg.map_or("–".to_string(), |m| format!("{m:.1}")));
+                if goal > 0 {
+                    tile(&format!("days with {goal}+ words"), summary.goal_days.to_string());
+                }
+            });
+
+            // ---- categories
+            ui.add_space(14.0);
+            ui.label(RichText::new("Entries by category").size(20.0).strong().color(p.title));
+            ui.add_space(6.0);
+            if summary.categories.is_empty() {
+                ui.label(RichText::new("Nothing written in this year yet.").color(p.muted));
+            }
+            let most = summary.categories.first().map_or(1, |c| c.1).max(1) as f32;
+            for (name, count) in &summary.categories {
+                ui.horizontal(|ui| {
+                    ui.add_sized([120.0, 22.0], egui::Label::new(RichText::new(name).color(p.ink)).truncate());
+                    let max_w = (ui.available_width() - 50.0).max(40.0);
+                    let (r, _) = ui.allocate_exact_size(vec2(max_w * *count as f32 / most, 20.0), Sense::hover());
+                    ui.painter().rect_filled(r, 5.0, category_color(cats, name));
+                    ui.label(RichText::new(count.to_string()).color(p.ink));
+                });
+            }
+
+            // ---- mood
+            ui.add_space(14.0);
+            ui.label(RichText::new("Mood through the year").size(20.0).strong().color(p.title));
+            ui.add_space(6.0);
+            if series.is_empty() {
+                ui.label(RichText::new("Rate your entries with the Mood buttons in the editor and they will be charted here.").color(p.muted));
+            } else {
+                mood_chart(ui, &p, &series, year);
+                ui.label(RichText::new("Dots are the day's average mood; the line is a 7-day average.").small().color(p.muted));
+            }
+            ui.add_space(12.0);
+        });
+
+        if let Some(day) = open_day {
+            ev.select = Some(day);
+            self.view = CalView::Day;
+            self.day_scroll_pending = true;
+        }
+    }
+
     /// Move an entry to another day (and, in the day view, another hour).
     fn move_entry(&mut self, id: u64, date: NaiveDate, hour: Option<u32>) {
         let Some(e) = self.data.entries.iter_mut().find(|e| e.id == id) else { return };
@@ -932,6 +1448,7 @@ impl DiaryApp {
             second,
             category: e.category.clone(),
             text: e.text.clone(),
+            mood: e.mood,
             focus: 0,
             want_focus: Some((usize::MAX, usize::MAX)),
         });
@@ -949,11 +1466,28 @@ impl DiaryApp {
             self.search_results(ui, &p);
             return;
         }
+        let entries: Vec<Entry> = self.day_entries(self.selected).into_iter().cloned().collect();
+        let memories: Vec<Entry> = stats::on_this_day(&self.data.entries, self.selected).into_iter().cloned().collect();
+        let words: usize = entries.iter().map(|e| markdown::word_count(&e.text)).sum();
+        let goal = self.data.settings.daily_word_goal as usize;
+
         ui.label(RichText::new(self.selected.format("%A").to_string()).size(14.0).color(p.muted));
         ui.label(RichText::new(self.selected.format("%e %B %Y").to_string()).size(22.0).strong().color(p.title));
         ui.add_space(6.0);
-        if ui.button("➕ Add entry for this day").clicked() {
+        if ui.button("➕ Add entry for this day").on_hover_text("New entry (Ctrl+N)").clicked() {
             self.new_entry(self.selected);
+        }
+        if goal > 0 {
+            ui.add_space(6.0);
+            let done = words >= goal;
+            let bar = egui::ProgressBar::new((words as f32 / goal as f32).min(1.0))
+                .text(RichText::new(format!("{words} / {goal} words{}", if done { "  ✓" } else { "" })).color(Color32::WHITE))
+                .fill(if done { Color32::from_rgb(22, 163, 74) } else { BLUE })
+                .desired_width(f32::INFINITY);
+            ui.add(bar);
+        } else if words > 0 {
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("{words} words")).small().color(p.muted));
         }
         if self.status.starts_with("Save failed") {
             ui.add_space(4.0);
@@ -965,10 +1499,10 @@ impl DiaryApp {
         ui.add_space(8.0);
         ui.separator();
 
-        let entries: Vec<Entry> = self.day_entries(self.selected).into_iter().cloned().collect();
         let body = ui.style().text_styles[&egui::TextStyle::Body].size;
         let mut edit = None;
         let mut delete = None;
+        let mut jump = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             if entries.is_empty() {
                 ui.add_space(8.0);
@@ -985,6 +1519,9 @@ impl DiaryApp {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&e.category).strong().color(fg));
+                            if let Some(m) = e.mood {
+                                mood_badge(ui, m);
+                            }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let time = e.added_at.get(11..16).unwrap_or("");
                                 ui.label(RichText::new(time).small().color(fg));
@@ -1005,6 +1542,38 @@ impl DiaryApp {
                     });
                 ui.add_space(6.0);
             }
+
+            // What was written on this date in earlier years.
+            if !memories.is_empty() {
+                ui.add_space(10.0);
+                ui.separator();
+                ui.label(RichText::new("On this day").size(18.0).strong().color(p.title));
+                ui.add_space(4.0);
+                for m in memories.iter().take(12) {
+                    let c = category_color(&self.data.categories, &m.category);
+                    let fg = text_on(c);
+                    let card = egui::Frame::new().fill(c).corner_radius(10).inner_margin(8).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(m.date.get(0..4).unwrap_or("")).strong().color(fg));
+                            if let Some(mood) = m.mood {
+                                mood_badge(ui, mood);
+                            }
+                            ui.label(RichText::new(m.added_at.get(11..16).unwrap_or("")).small().color(fg));
+                        });
+                        let mut s = markdown::summary(&m.text);
+                        if s.chars().count() > 100 {
+                            s = s.chars().take(100).collect::<String>() + "…";
+                        }
+                        ui.label(RichText::new(s).color(fg));
+                    });
+                    let resp = ui.interact(card.response.rect, ui.id().with(("memory", m.id)), Sense::click());
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        jump = NaiveDate::parse_from_str(&m.date, "%Y-%m-%d").ok();
+                    }
+                    ui.add_space(4.0);
+                }
+            }
         });
 
         if let Some(id) = edit {
@@ -1013,6 +1582,11 @@ impl DiaryApp {
         if let Some(id) = delete {
             self.data.entries.retain(|e| e.id != id);
             self.persist();
+        }
+        if let Some(d) = jump {
+            self.selected = d;
+            self.month = d.with_day(1).unwrap();
+            self.day_scroll_pending = true;
         }
     }
 
@@ -1071,10 +1645,13 @@ impl DiaryApp {
         }
         let p = palette(ctx);
         let dark = ctx.theme() == egui::Theme::Dark;
-        let DiaryApp { editor, data, media, show_marks, editor_msg, .. } = self;
+        let DiaryApp { editor, data, media, show_marks, editor_msg, save_requested, .. } = self;
         let ed = editor.as_mut().unwrap();
         let mut save_it = false;
         let mut cancel = false;
+        if std::mem::take(save_requested) && !ed.text.trim().is_empty() {
+            save_it = true;
+        }
 
         // Keyboard shortcuts for the common formats.
         let shortcuts = [(egui::Key::B, markdown::Format::Bold), (egui::Key::I, markdown::Format::Italic)];
@@ -1135,6 +1712,28 @@ impl DiaryApp {
                                     );
                                 }
                             });
+                        ui.add_space(10.0);
+                        ui.label("Mood:");
+                        for m in 1..=5u8 {
+                            let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+                            let col = mood_color(f32::from(m));
+                            let on = ed.mood == Some(m);
+                            ui.painter().circle_filled(r.center(), 11.0, if on { col } else { col.gamma_multiply(0.4) });
+                            if on {
+                                ui.painter().circle_stroke(r.center(), 12.5, Stroke::new(2.0, p.ink));
+                            }
+                            ui.painter().text(
+                                r.center(),
+                                Align2::CENTER_CENTER,
+                                m.to_string(),
+                                FontId::proportional(13.0),
+                                if on { text_on(col) } else { p.ink },
+                            );
+                            let resp = resp.on_hover_text(format!("{} (click again to clear)", MOOD_LABELS[usize::from(m) - 1]));
+                            if resp.clicked() {
+                                ed.mood = if on { None } else { Some(m) };
+                            }
+                        }
                     });
                     ui.add_space(6.0);
 
@@ -1287,6 +1886,28 @@ impl DiaryApp {
                         if ui.button("Cancel").clicked() {
                             cancel = true;
                         }
+                        ui.add_space(12.0);
+                        let draft = markdown::word_count(&ed.text);
+                        ui.label(RichText::new(format!("{draft} {}", if draft == 1 { "word" } else { "words" })).color(p.muted));
+                        let goal = data.settings.daily_word_goal as usize;
+                        if goal > 0 {
+                            // Progress for the whole day: this draft plus the day's other entries.
+                            let day = key(ed.date);
+                            let others: usize = data
+                                .entries
+                                .iter()
+                                .filter(|e| e.date == day && Some(e.id) != ed.id)
+                                .map(|e| markdown::word_count(&e.text))
+                                .sum();
+                            let total = others + draft;
+                            let done = total >= goal;
+                            ui.add(
+                                egui::ProgressBar::new((total as f32 / goal as f32).min(1.0))
+                                    .text(RichText::new(format!("day: {total} / {goal}{}", if done { "  ✓" } else { "" })).color(Color32::WHITE))
+                                    .fill(if done { Color32::from_rgb(22, 163, 74) } else { BLUE })
+                                    .desired_width(210.0),
+                            );
+                        }
                     });
                 });
             });
@@ -1302,11 +1923,12 @@ impl DiaryApp {
                         e.category = ed.category;
                         e.date = key(ed.date);
                         e.added_at = added_at;
+                        e.mood = ed.mood;
                     }
                 }
                 None => {
                     let id = self.data.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-                    self.data.entries.push(Entry { id, date: key(ed.date), added_at, category: ed.category, text });
+                    self.data.entries.push(Entry { id, date: key(ed.date), added_at, category: ed.category, text, mood: ed.mood });
                 }
             }
             self.selected = ed.date;
@@ -1525,6 +2147,7 @@ impl eframe::App for DiaryApp {
                 }
             }
         }
+        self.handle_shortcuts(&ctx);
         if self.lock.is_some() {
             egui::Panel::top("header")
                 .frame(egui::Frame::new().fill(p.header).inner_margin(egui::Margin::symmetric(14, 10)))
@@ -1550,6 +2173,9 @@ impl eframe::App for DiaryApp {
         self.entry_window(&ctx);
         self.categories_window(&ctx);
         self.password_window(&ctx);
+        self.location_window(&ctx);
+        self.shortcuts_window(&ctx);
+        self.export_window(&ctx);
     }
 }
 
@@ -1738,6 +2364,7 @@ mod tests {
             second: 0,
             category: "Personal".into(),
             text: text.into(),
+            mood: None,
             focus: 0,
             want_focus: None,
         }
@@ -1835,8 +2462,12 @@ mod tests {
                 added_at: format!("{date} {time}"),
                 category: "Work".into(),
                 text: text.into(),
+                mood: None,
             });
         }
+        app.data.entries[0].mood = Some(4);
+        app.data.entries[2].mood = Some(2);
+        app.data.settings.daily_word_goal = 5;
         app
     }
 
@@ -1900,12 +2531,77 @@ mod tests {
         assert_eq!(e.date, "2026-10-14");
         assert_eq!(e.added_at, "2026-10-14 09:15:00");
     }
+
+    fn press(app: &mut DiaryApp, key: egui::Key, modifiers: egui::Modifiers) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| app.handle_shortcuts(ui.ctx()));
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn keyboard_shortcuts() {
+        let ctrl = egui::Modifiers::COMMAND;
+        let mut app = app_with_entries();
+        app.view = CalView::Month;
+
+        press(&mut app, egui::Key::Num2, ctrl);
+        assert_eq!(app.view, CalView::Week);
+        press(&mut app, egui::Key::Num4, ctrl);
+        assert_eq!(app.view, CalView::Year);
+        press(&mut app, egui::Key::Num1, ctrl);
+        assert_eq!(app.view, CalView::Day);
+
+        let before = app.selected;
+        press(&mut app, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        assert_eq!(app.selected, before + chrono::Days::new(1));
+        press(&mut app, egui::Key::ArrowLeft, egui::Modifiers::NONE);
+        assert_eq!(app.selected, before);
+
+        press(&mut app, egui::Key::T, ctrl);
+        assert_eq!(app.selected, Local::now().date_naive());
+
+        assert!(app.editor.is_none());
+        press(&mut app, egui::Key::N, ctrl);
+        assert!(app.editor.is_some(), "Ctrl+N starts a new entry");
+        // While writing, Ctrl+S asks for a save and Ctrl+N does not start another entry.
+        app.editor.as_mut().unwrap().text = "hello".into();
+        press(&mut app, egui::Key::S, ctrl);
+        assert!(app.save_requested);
+
+        press(&mut app, egui::Key::L, ctrl);
+        assert!(app.lock.is_some(), "Ctrl+L locks");
+    }
+
+    #[test]
+    fn export_ranges_and_counts() {
+        let app = app_with_entries(); // selected 2026-10-09 (a Friday); entries on the 9th (x3) and 12th
+        let (from, to, _, slug) = app.export_range(ExportScope::Month);
+        assert_eq!((from, to, slug.as_str()), (d(2026, 10, 1), d(2026, 10, 31), "2026-10"));
+        assert_eq!(app.entries_in(from, to).len(), 4);
+        let (from, to, _, slug) = app.export_range(ExportScope::Week);
+        assert_eq!((from, to, slug.as_str()), (d(2026, 10, 5), d(2026, 10, 11), "week-2026-10-05"));
+        assert_eq!(app.entries_in(from, to).len(), 3);
+        let (from, to, ..) = app.export_range(ExportScope::Day);
+        assert_eq!(app.entries_in(from, to).len(), 3);
+        let (from, to, ..) = app.export_range(ExportScope::Year);
+        assert_eq!((from, to), (d(2026, 1, 1), d(2026, 12, 31)));
+        let (from, to, ..) = app.export_range(ExportScope::All);
+        assert_eq!(app.entries_in(from, to).len(), 4);
+        // And the real PDF builder accepts what the window would give it.
+        let entries = app.entries_in(d(2026, 10, 1), d(2026, 10, 31));
+        let report = export::Report { title: "T".into(), subtitle: "S".into(), entries, include_images: true };
+        assert!(export::build_pdf(&report, &app.data.categories, &app.data.images).unwrap().starts_with(b"%PDF"));
+    }
     #[test]
     fn all_calendar_views_render() {
         let ctx = egui::Context::default();
         setup_style(&ctx);
         let mut app = app_with_entries();
-        for view in [CalView::Month, CalView::Week, CalView::Day, CalView::Month] {
+        for view in [CalView::Month, CalView::Week, CalView::Day, CalView::Year, CalView::Month] {
             app.view = view;
             for _ in 0..3 {
                 let mut out = ctx.run_ui(egui::RawInput::default(), |ui| app.calendar(ui));
@@ -1997,6 +2693,7 @@ fn paint_cog(painter: &egui::Painter, center: egui::Pos2, r: f32, color: Color32
 enum CalView {
     Month,
     Week,
+    Year,
     Day,
 }
 
@@ -2102,4 +2799,84 @@ fn pill(
     } else if resp.clicked() {
         ev.select = NaiveDate::parse_from_str(&e.date, "%Y-%m-%d").ok();
     }
+}
+
+/// What the lock screen should ask for, judging by the diary file on disk.
+fn current_lock_mode() -> LockMode {
+    match inspect() {
+        Disk::Missing => LockMode::Create,
+        Disk::Encrypted(env) => LockMode::Unlock(env),
+        Disk::Plain(data) => LockMode::Encrypt(data),
+        Disk::Unreadable(why) => LockMode::Broken(why),
+    }
+}
+
+const MOOD_LABELS: [&str; 5] = ["Awful", "Low", "Okay", "Good", "Great"];
+
+/// Red (1) through amber to green (5); fractional values blend.
+fn mood_color(value: f32) -> Color32 {
+    const RAMP: [[f32; 3]; 5] = [[239.0, 68.0, 68.0], [249.0, 115.0, 22.0], [234.0, 179.0, 8.0], [132.0, 204.0, 22.0], [34.0, 197.0, 94.0]];
+    let v = (value.clamp(1.0, 5.0) - 1.0).min(3.999);
+    let (i, t) = (v.floor() as usize, v.fract());
+    let c = |k: usize| RAMP[i][k] + (RAMP[i + 1][k] - RAMP[i][k]) * t;
+    Color32::from_rgb(c(0) as u8, c(1) as u8, c(2) as u8)
+}
+
+/// A small coloured circle holding the mood number.
+fn mood_badge(ui: &mut egui::Ui, mood: u8) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+    let col = mood_color(f32::from(mood));
+    ui.painter().circle_filled(rect.center(), 9.0, col);
+    ui.painter().circle_stroke(rect.center(), 9.0, Stroke::new(1.0, Color32::from_black_alpha(90)));
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, mood.to_string(), FontId::proportional(12.0), text_on(col));
+    resp.on_hover_text(format!("Mood: {}", MOOD_LABELS[usize::from(mood.clamp(1, 5)) - 1]));
+}
+
+/// Heat-map shade for a level from 0 (nothing written) to 4 (a lot).
+fn heat_color(level: u8, dark: bool) -> Color32 {
+    const LIGHT: [[u8; 3]; 5] = [[226, 232, 240], [191, 219, 254], [147, 197, 253], [59, 130, 246], [29, 78, 216]];
+    const DARK: [[u8; 3]; 5] = [[30, 41, 59], [30, 58, 138], [37, 99, 235], [96, 165, 250], [191, 219, 254]];
+    rgb(if dark { DARK } else { LIGHT }[usize::from(level.min(4))])
+}
+
+/// Daily mood dots with a 7-day average line, over one year.
+fn mood_chart(ui: &mut egui::Ui, p: &Palette, series: &[(NaiveDate, f32, f32)], year: i32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 190.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let plot = egui::Rect::from_min_max(rect.min + vec2(34.0, 8.0), rect.max - vec2(8.0, 24.0));
+    painter.rect_filled(plot, 4.0, p.cell);
+    painter.rect_stroke(plot, 4.0, Stroke::new(1.0, p.cell_border), egui::StrokeKind::Inside);
+
+    let y_of = |v: f32| plot.max.y - (v - 1.0) / 4.0 * plot.height();
+    for v in 1..=5 {
+        let y = y_of(v as f32);
+        painter.line_segment([egui::pos2(plot.min.x, y), egui::pos2(plot.max.x, y)], Stroke::new(1.0, p.cell_border.gamma_multiply(0.5)));
+        painter.text(egui::pos2(plot.min.x - 6.0, y), Align2::RIGHT_CENTER, v.to_string(), FontId::proportional(12.0), p.muted);
+    }
+    let days_in_year = NaiveDate::from_ymd_opt(year, 12, 31).unwrap().ordinal() as f32;
+    let x_of = |d: NaiveDate| plot.min.x + (d.ordinal0() as f32 + 0.5) / days_in_year * plot.width();
+    for m in 1..=12 {
+        let first = NaiveDate::from_ymd_opt(year, m, 1).unwrap();
+        painter.text(egui::pos2(x_of(first), plot.max.y + 4.0), Align2::LEFT_TOP, first.format("%b").to_string(), FontId::proportional(12.0), p.muted);
+    }
+    for (d, m, _) in series {
+        painter.circle_filled(egui::pos2(x_of(*d), y_of(*m)), 3.5, mood_color(*m));
+    }
+    if series.len() >= 2 {
+        let points: Vec<egui::Pos2> = series.iter().map(|(d, _, avg)| egui::pos2(x_of(*d), y_of(*avg))).collect();
+        painter.add(egui::Shape::line(points, Stroke::new(2.5, p.accent)));
+    }
+}
+
+fn search_id() -> egui::Id {
+    egui::Id::new("search_box")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExportScope {
+    Day,
+    Week,
+    Month,
+    Year,
+    All,
 }
