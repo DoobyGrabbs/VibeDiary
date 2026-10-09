@@ -220,13 +220,12 @@ fn blocks(bl: &[Block], ctx: &Ctx) -> LinearLayout {
     out
 }
 
-/// Build the PDF and return its bytes.
-pub fn build_pdf(report: &Report, cats: &[Category], images: &BTreeMap<String, String>) -> Result<Vec<u8>, String> {
+/// A new A4 document with the usual fonts, margins and page numbers. Also returns the monospace
+/// font family (the normal one if `wants_code` is false).
+fn new_document(title: &str, wants_code: bool) -> Result<(Document, FontFamily<Font>), String> {
     let text = load_family(SEGOE)
         .or_else(|| load_family(ARIAL))
         .ok_or("Couldn't find a font to use (Segoe UI or Arial).")?;
-    // A monospace font is only added (it makes the PDF bigger) when some entry uses code.
-    let wants_code = report.entries.iter().any(|e| e.text.contains('`'));
     let mono = if wants_code { load_family(CONSOLAS).or_else(|| load_family(COURIER_NEW)) } else { None };
 
     let mut doc = Document::new(text);
@@ -234,7 +233,7 @@ pub fn build_pdf(report: &Report, cats: &[Category], images: &BTreeMap<String, S
         Some(family) => doc.add_font_family(family),
         None => doc.font_cache().default_font_family(),
     };
-    doc.set_title(report.title.clone());
+    doc.set_title(title);
     doc.set_minimal_conformance();
     doc.set_paper_size(PaperSize::A4);
     doc.set_font_size(BODY);
@@ -245,6 +244,127 @@ pub fn build_pdf(report: &Report, cats: &[Category], images: &BTreeMap<String, S
         Paragraph::new(StyledString::new(format!("{page}"), Style::new().with_font_size(9).with_color(GREY))).aligned(Alignment::Right)
     });
     doc.set_page_decorator(decorator);
+    Ok((doc, mono))
+}
+
+fn heading(text: &str) -> Paragraph {
+    Paragraph::new(StyledString::new(text, Style::new().bold().with_font_size(14).with_color(BLUE)))
+}
+
+/// A one-page summary of a week, month or year: the numbers, a few pictures and some highlights.
+pub fn build_review_pdf(
+    review: &crate::reports::Review,
+    cats: &[Category],
+    images: &BTreeMap<String, String>,
+    include_images: bool,
+) -> Result<Vec<u8>, String> {
+    let (mut doc, mono) = new_document(review.title, false)?;
+    let ctx = Ctx { mono, images, include_images };
+    let range = if review.from == review.to { review.from.format("%e %B %Y").to_string() } else { format!("{} to {}", review.from.format("%e %B %Y"), review.to.format("%e %B %Y")) };
+
+    doc.push(Paragraph::new(StyledString::new(review.title, Style::new().bold().with_font_size(24).with_color(BLUE))));
+    doc.push(Paragraph::new(StyledString::new(range.trim().to_string(), Style::new().with_font_size(11).with_color(GREY))));
+    doc.push(Break::new(1.2));
+
+    let s = &review.summary;
+    doc.push(heading("At a glance"));
+    doc.push(Break::new(0.3));
+    let mut list = elements::UnorderedList::new();
+    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    list.push(Paragraph::new(format!("{} on {}", plural(s.entries, "entry", "entries"), plural(s.days_written, "day", "days"))));
+    list.push(Paragraph::new(format!("{} written", plural(s.words, "word", "words"))));
+    list.push(Paragraph::new(format!("Longest run of days in a row: {}; current run: {}", s.longest_streak, s.current_streak)));
+    if let Some(m) = s.mood_avg {
+        let change = match review.previous_mood {
+            Some(p) if (m - p).abs() >= 0.05 => format!(" ({} {:.1} on the period before)", if m > p { "up" } else { "down" }, (m - p).abs()),
+            Some(_) => " (about the same as the period before)".to_string(),
+            None => String::new(),
+        };
+        list.push(Paragraph::new(format!("Average mood {m:.1} out of 5{change}")));
+    }
+    if let Some((d, m)) = review.best_day {
+        list.push(Paragraph::new(format!("Happiest day: {} ({m:.1})", d.format("%A %e %B"))));
+    }
+    if let Some((d, m)) = review.hardest_day.filter(|h| Some(h.0) != review.best_day.map(|b| b.0)) {
+        list.push(Paragraph::new(format!("Hardest day: {} ({m:.1})", d.format("%A %e %B"))));
+    }
+    if s.goal_days > 0 {
+        list.push(Paragraph::new(format!("Daily word goal reached on {}", plural(s.goal_days, "day", "days"))));
+    }
+    doc.push(list);
+
+    if !s.categories.is_empty() {
+        doc.push(Break::new(1.0));
+        doc.push(heading("Where you wrote"));
+        doc.push(Break::new(0.3));
+        let mut list = elements::UnorderedList::new();
+        for (name, n) in &s.categories {
+            list.push(Paragraph::new(format!("{name}: {}", plural(*n, "entry", "entries"))));
+        }
+        doc.push(list);
+    }
+    if !review.top_words.is_empty() {
+        doc.push(Break::new(1.0));
+        doc.push(heading("Words that kept coming up"));
+        doc.push(Break::new(0.3));
+        let words: Vec<String> = review.top_words.iter().map(|(w, n)| format!("{w} ({n})")).collect();
+        doc.push(Paragraph::new(clean(&words.join(", "))));
+    }
+
+    if include_images && !review.pictures.is_empty() {
+        doc.push(Break::new(1.0));
+        doc.push(heading("Pictures"));
+        doc.push(Break::new(0.4));
+        let prepared: Vec<_> = review
+            .pictures
+            .iter()
+            .filter_map(|(id, _)| ctx.images.get(id))
+            .filter_map(|b64| B64.decode(b64).ok())
+            .filter_map(|bytes| prepare_picture(&bytes))
+            .filter_map(|(bytes, width)| {
+                let dpi = f64::from(width) * 25.4 / 52.0; // each about 52 mm wide
+                elements::Image::from_reader(std::io::Cursor::new(bytes)).ok().map(|i| i.with_dpi(dpi))
+            })
+            .collect();
+        let mut table = elements::TableLayout::new(vec![1, 1, 1]);
+        let mut cells: Vec<Box<dyn Element>> = prepared.into_iter().map(|i| Box::new(i) as Box<dyn Element>).collect();
+        while !cells.is_empty() {
+            let mut row: Vec<Box<dyn Element>> = cells.drain(..cells.len().min(3)).collect();
+            while row.len() < 3 {
+                row.push(Box::new(Break::new(0.1)));
+            }
+            table.push_row(row).map_err(|e| e.to_string())?;
+        }
+        doc.push(table);
+    }
+
+    if !review.highlights.is_empty() {
+        doc.push(Break::new(1.0));
+        doc.push(heading("Entries to remember"));
+        doc.push(Break::new(0.4));
+        for h in &review.highlights {
+            let rgb = cats.iter().find(|c| c.name == h.category).map_or([110, 110, 110], |c| c.color);
+            let tint = Color::Rgb((rgb[0] as f32 * 0.6) as u8, (rgb[1] as f32 * 0.6) as u8, (rgb[2] as f32 * 0.6) as u8);
+            let when = NaiveDate::parse_from_str(&h.date, "%Y-%m-%d").map(|d| d.format("%a %e %b").to_string()).unwrap_or_default();
+            doc.push(Paragraph::new(StyledString::new(
+                clean(&format!("{when}   {}   {}", h.time, h.category)),
+                Style::new().bold().with_font_size(10).with_color(tint),
+            )));
+            doc.push(Paragraph::new(clean(&h.snippet)));
+            doc.push(Break::new(0.8));
+        }
+    }
+
+    let mut bytes = Vec::new();
+    doc.render(&mut bytes).map_err(|e| format!("Couldn't create the PDF: {e}"))?;
+    Ok(compress(bytes))
+}
+
+/// Build the PDF and return its bytes.
+pub fn build_pdf(report: &Report, cats: &[Category], images: &BTreeMap<String, String>) -> Result<Vec<u8>, String> {
+    // A monospace font is only added (it makes the PDF bigger) when some entry uses code.
+    let wants_code = report.entries.iter().any(|e| e.text.contains('`'));
+    let (mut doc, mono) = new_document(&report.title, wants_code)?;
 
     let ctx = Ctx { mono, images, include_images: report.include_images };
     doc.push(Paragraph::new(StyledString::new(report.title.clone(), Style::new().bold().with_font_size(24).with_color(BLUE))));
@@ -279,6 +399,13 @@ pub fn build_pdf(report: &Report, cats: &[Category], images: &BTreeMap<String, S
             doc.push(Paragraph::new(StyledString::new(head, Style::new().bold().with_font_size(10).with_color(tint))));
             doc.push(Break::new(0.3));
             doc.push(blocks(&parse(&e.text.replace('\n', "  \n")), &ctx));
+            if !e.attachments.is_empty() {
+                let names: Vec<String> = e.attachments.iter().map(|a| format!("{} ({})", a.name, crate::human_size(a.size))).collect();
+                doc.push(Paragraph::new(StyledString::new(
+                    clean(&format!("Attachments: {} (not included in the PDF)", names.join(", "))),
+                    Style::new().italic().with_font_size(9).with_color(GREY),
+                )));
+            }
             doc.push(Break::new(1.4));
         }
         doc.push(Break::new(0.6));
@@ -294,7 +421,7 @@ mod tests {
     use super::*;
 
     fn entry(id: u64, date: &str, text: &str, mood: Option<u8>) -> Entry {
-        Entry { id, date: date.into(), added_at: format!("{date} 09:30:00"), category: "Work".into(), text: text.into(), mood }
+        Entry { id, date: date.into(), added_at: format!("{date} 09:30:00"), category: "Work".into(), text: text.into(), mood, ..Default::default() }
     }
 
     fn png_b64() -> String {

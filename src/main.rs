@@ -9,9 +9,13 @@ use location::data_path;
 mod icon;
 mod export;
 mod faces;
+mod gallery;
 mod live;
+mod insights;
 mod location;
 mod markdown;
+mod pinned;
+mod reports;
 mod stats;
 mod vault;
 
@@ -86,7 +90,7 @@ struct Category {
     color: [u8; 3],
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct Entry {
     id: u64,
     /// The diary day the entry belongs to, YYYY-MM-DD.
@@ -95,9 +99,18 @@ struct Entry {
     added_at: String,
     category: String,
     text: String,
-    /// How the day felt, 1 (awful) to 5 (great).
+    /// How the day felt, 1 (really sad) to 5 (really happy).
     #[serde(default)]
     mood: Option<u8>,
+    /// Pinned entries are listed under "Pinned" and starred on the calendar.
+    #[serde(default)]
+    pinned: bool,
+    /// Private entries stay hidden until you click to reveal them.
+    #[serde(default)]
+    sensitive: bool,
+    /// Files attached to the entry (the data is in `Data::files`).
+    #[serde(default)]
+    attachments: Vec<Attachment>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -107,6 +120,9 @@ struct Data {
     /// Images used by entries: id -> base64 of the (re-encoded) image file.
     #[serde(default)]
     images: BTreeMap<String, String>,
+    /// Attached files: id -> base64 of the file.
+    #[serde(default)]
+    files: BTreeMap<String, String>,
     #[serde(default)]
     settings: Settings,
 }
@@ -118,11 +134,15 @@ struct Settings {
     auto_lock_minutes: u32,
     /// Daily writing goal in words; 0 means no goal.
     daily_word_goal: u32,
+    /// Interface zoom, 1.0 = normal.
+    ui_scale: f32,
+    /// Hide the diary while its window is not the active one.
+    privacy_screen: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { auto_lock_minutes: 10, daily_word_goal: 0 }
+        Self { auto_lock_minutes: 10, daily_word_goal: 0, ui_scale: 1.0, privacy_screen: true }
     }
 }
 
@@ -141,7 +161,7 @@ fn default_categories() -> Vec<Category> {
 
 
 fn fresh_data() -> Data {
-    Data { categories: default_categories(), entries: Vec::new(), images: BTreeMap::new(), settings: Settings::default() }
+    Data { categories: default_categories(), entries: Vec::new(), images: BTreeMap::new(), files: BTreeMap::new(), settings: Settings::default() }
 }
 
 /// What is currently on disk.
@@ -182,6 +202,7 @@ fn inspect() -> Disk {
                 category: category.clone(),
                 text,
                 mood: None,
+                ..Default::default()
             })
             .collect();
         return Disk::Plain(data);
@@ -230,6 +251,9 @@ struct EditState {
     category: String,
     text: String,
     mood: Option<u8>,
+    pinned: bool,
+    sensitive: bool,
+    attachments: Vec<Attachment>,
     /// Index of the text block that last had the cursor (target of toolbar actions).
     focus: usize,
     /// Move the cursor here next frame: (text block index, char position); `usize::MAX` = last / end.
@@ -296,6 +320,7 @@ struct DiaryApp {
     show_export: bool,
     export_scope: ExportScope,
     export_images: bool,
+    export_private: bool,
     export_msg: String,
     export_path: Option<std::path::PathBuf>,
     /// Ctrl+S was pressed while writing an entry.
@@ -307,6 +332,15 @@ struct DiaryApp {
     status: String,
     media: markdown::Media,
     show_marks: bool,
+    insights: insights::InsightsState,
+    photos_cache: Option<(u64, Vec<gallery::Photo>)>,
+    thumb_size: f32,
+    lightbox: Option<usize>,
+    /// Distraction-free writing: the editor fills the window.
+    focus_mode: bool,
+    /// Private entries the user has clicked open (forgotten on lock).
+    revealed: std::collections::HashSet<u64>,
+    show_pinned: bool,
     view: CalView,
     /// Bumped whenever the diary changes; invalidates `stats_cache`.
     rev: u64,
@@ -325,6 +359,7 @@ struct DiaryApp {
 
 impl DiaryApp {
     fn new() -> Self {
+clear_open_files(); // leftovers from opening attachments last time
         let today = Local::now().date_naive();
         let mode = current_lock_mode();
         Self {
@@ -344,6 +379,7 @@ impl DiaryApp {
             show_export: false,
             export_scope: ExportScope::Month,
             export_images: true,
+            export_private: false,
             export_msg: String::new(),
             export_path: None,
             save_requested: false,
@@ -354,6 +390,13 @@ impl DiaryApp {
             status: String::new(),
             media: markdown::Media::default(),
             show_marks: false,
+            insights: insights::InsightsState::default(),
+            photos_cache: None,
+            thumb_size: 150.0,
+            lightbox: None,
+            focus_mode: false,
+            revealed: std::collections::HashSet::new(),
+            show_pinned: false,
             view: CalView::Month,
             rev: 0,
             stats_cache: None,
@@ -388,6 +431,12 @@ impl DiaryApp {
             used.extend(markdown::image_ids(&ed.text));
         }
         self.data.images.retain(|id, _| used.contains(id));
+        // Attached files nobody refers to any more (including by an open draft) are dropped too.
+        let mut files: std::collections::HashSet<String> = self.data.entries.iter().flat_map(|e| e.attachments.iter().map(|a| a.id.clone())).collect();
+        if let Some(ed) = &self.editor {
+            files.extend(ed.attachments.iter().map(|a| a.id.clone()));
+        }
+        self.data.files.retain(|id, _| files.contains(id));
     }
 
     /// Try to unlock / create / encrypt using what was typed on the lock screen.
@@ -436,12 +485,19 @@ impl DiaryApp {
         self.data = fresh_data();
         self.vault = None;
         self.media = markdown::Media::default();
+        self.revealed.clear();
+        clear_open_files();
         self.stats_cache = None;
+        self.photos_cache = None;
+        self.lightbox = None;
+        self.insights.clear();
         self.search.clear();
         self.show_categories = false;
         self.show_password = false;
         self.show_location = false;
         self.show_export = false;
+        self.show_pinned = false;
+        self.focus_mode = false;
         self.show_shortcuts = false;
         self.lock = Some(Lock::new(mode));
     }
@@ -673,6 +729,9 @@ impl DiaryApp {
             category,
             text: String::new(),
             mood: None,
+            pinned: false,
+            sensitive: false,
+            attachments: Vec::new(),
             focus: 0,
             want_focus: Some((usize::MAX, usize::MAX)),
         });
@@ -686,6 +745,38 @@ impl DiaryApp {
             CalView::Week => self.shift_days(7 * dir),
             CalView::Day => self.shift_days(dir),
             CalView::Year => self.shift_year(dir as i32),
+            CalView::Photos => {}
+        }
+    }
+
+    /// Make the interface bigger (`+1`) or smaller (`-1`) by one step and remember it.
+    fn step_zoom(&mut self, dir: i32) {
+        const STEPS: [f32; 7] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6];
+        let now = self.data.settings.ui_scale;
+        let nearest = STEPS.iter().enumerate().min_by(|a, b| (a.1 - now).abs().total_cmp(&(b.1 - now).abs())).map_or(2, |(i, _)| i);
+        let next = (nearest as i32 + dir).clamp(0, STEPS.len() as i32 - 1) as usize;
+        if (STEPS[next] - now).abs() > 0.001 {
+            self.data.settings.ui_scale = STEPS[next];
+            self.persist();
+        }
+    }
+
+    /// Jump to a random entry from the past, as a way of looking back. Private entries are skipped.
+    fn random_entry(&mut self) {
+        let today = key(Local::now().date_naive());
+        let older: Vec<&Entry> = self.data.entries.iter().filter(|e| !e.sensitive && e.date < today).collect();
+        let pool: Vec<&Entry> = if older.is_empty() { self.data.entries.iter().filter(|e| !e.sensitive).collect() } else { older };
+        if pool.is_empty() {
+            self.status = "There are no entries to look back on yet.".into();
+            return;
+        }
+        let pick = pool[getrandom::u64().unwrap_or(0) as usize % pool.len()];
+        if let Ok(d) = NaiveDate::parse_from_str(&pick.date, "%Y-%m-%d") {
+            self.selected = d;
+            self.month = d.with_day(1).unwrap();
+            self.day_scroll_pending = true;
+            self.search.clear();
+            self.status = format!("A look back: {}", d.format("%A %e %B %Y"));
         }
     }
 
@@ -704,6 +795,17 @@ impl DiaryApp {
             return;
         }
         let cmd = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, key));
+        // Text size (zoom).
+        if cmd(Key::Equals) || cmd(Key::Plus) {
+            self.step_zoom(1);
+        }
+        if cmd(Key::Minus) {
+            self.step_zoom(-1);
+        }
+        if cmd(Key::Num0) {
+            self.data.settings.ui_scale = 1.0;
+            self.persist();
+        }
         let editing = self.editor.is_some();
 
         if cmd(Key::L) {
@@ -711,6 +813,13 @@ impl DiaryApp {
             return;
         }
         if editing {
+            // F11 toggles focus mode; Esc leaves it.
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F11)) {
+                self.focus_mode = !self.focus_mode;
+            }
+            if self.focus_mode && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.focus_mode = false;
+            }
             // Ctrl+S saves the entry being written.
             if cmd(Key::S) || cmd(Key::Enter) {
                 self.save_requested = true;
@@ -726,17 +835,20 @@ impl DiaryApp {
         if cmd(Key::E) {
             self.show_export = true;
         }
+        if cmd(Key::R) {
+            self.random_entry();
+        }
         if cmd(Key::T) {
             self.go_today();
         }
-        for (key, view) in [(Key::Num1, CalView::Day), (Key::Num2, CalView::Week), (Key::Num3, CalView::Month), (Key::Num4, CalView::Year)] {
+        for (key, view) in [(Key::Num1, CalView::Day), (Key::Num2, CalView::Week), (Key::Num3, CalView::Month), (Key::Num4, CalView::Year), (Key::Num5, CalView::Photos)] {
             if cmd(key) {
                 self.view = view;
                 self.day_scroll_pending = true;
             }
         }
         // Arrow keys move through time, unless a text box wants them.
-        if !ctx.egui_wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() && self.lightbox.is_none() && self.view != CalView::Photos {
             if ctx.input(|i| i.key_pressed(Key::ArrowLeft)) {
                 self.step_calendar(-1);
             }
@@ -770,7 +882,7 @@ impl DiaryApp {
 
     fn entries_in(&self, from: NaiveDate, to: NaiveDate) -> Vec<&Entry> {
         let (from, to) = (key(from), key(to));
-        self.data.entries.iter().filter(|e| e.date >= from && e.date <= to).collect()
+        self.data.entries.iter().filter(|e| e.date >= from && e.date <= to && (self.export_private || !e.sensitive)).collect()
     }
 
     fn export_window(&mut self, ctx: &egui::Context) {
@@ -816,6 +928,7 @@ impl DiaryApp {
                     }
                     ui.add_space(8.0);
                     ui.checkbox(&mut self.export_images, "Include pictures");
+                    ui.checkbox(&mut self.export_private, "Include private entries (their text will be readable in the PDF)");
                     ui.add_space(6.0);
                     ui.label(RichText::new("The PDF is a plain copy of your entries. It is not encrypted or password protected, so keep it somewhere safe.").small().color(p.muted));
                     ui.add_space(10.0);
@@ -886,14 +999,17 @@ impl DiaryApp {
             .show(ctx, |ui| {
                 close |= popup_header(ui, &p, "Keyboard shortcuts");
                 egui::Frame::new().inner_margin(14).show(ui, |ui| {
-                    let rows: [(&str, &str); 14] = [
+                    let rows: [(&str, &str); 17] = [
                         ("Ctrl+N", "New entry on the selected day"),
                         ("Ctrl+F", "Search entries"),
                         ("Ctrl+T", "Jump to today"),
                         ("Ctrl+L", "Lock the diary"),
                         ("Ctrl+E", "Export entries to PDF"),
+                        ("Ctrl+R", "Jump to a random entry"),
+                        ("Ctrl + / Ctrl -", "Bigger / smaller text (Ctrl+0 resets)"),
+                        ("F11", "Focus mode while writing (Esc leaves it)"),
                         ("← / →", "Previous / next month, week, day or year"),
-                        ("Ctrl+1 … 4", "Day, Week, Month, Year view"),
+                        ("Ctrl+1 … 5", "Day, Week, Month, Year, Photos view"),
                         ("Double-click", "A day: new entry. An entry: edit it"),
                         ("Drag", "Move an entry to another day or hour"),
                         ("Esc", "Cancel a drag"),
@@ -958,6 +1074,18 @@ impl DiaryApp {
                         self.backup();
                         ui.close();
                     }
+                    ui.menu_button("Text size", |ui| {
+                        for (label, scale) in [("80%", 0.8), ("90%", 0.9), ("100% (normal)", 1.0), ("110%", 1.1), ("125%", 1.25), ("140%", 1.4), ("160%", 1.6)] {
+                            let on = (self.data.settings.ui_scale - scale).abs() < 0.01;
+                            if ui.radio(on, label).clicked() {
+                                self.data.settings.ui_scale = scale;
+                                settings_changed = true;
+                            }
+                        }
+                    });
+                    settings_changed |= ui
+                        .checkbox(&mut self.data.settings.privacy_screen, "Hide the diary when the window is in the background")
+                        .changed();
                     ui.menu_button("Daily word goal", |ui| {
                         for (label, words) in [("Off", 0), ("100 words", 100), ("250 words", 250), ("500 words", 500), ("750 words", 750), ("1,000 words", 1000)] {
                             settings_changed |= ui.radio_value(&mut self.data.settings.daily_word_goal, words, label).changed();
@@ -974,6 +1102,12 @@ impl DiaryApp {
                 }
                 if ui.button("Lock").on_hover_text("Lock the diary (Ctrl+L)").clicked() {
                     self.lock_now();
+                }
+                if ui.button("Insights").on_hover_text("Mood patterns, writing statistics and reviews").clicked() {
+                    self.insights.open = !self.insights.open;
+                }
+                if ui.button("Pinned").on_hover_text("Your pinned entries").clicked() {
+                    self.show_pinned = !self.show_pinned;
                 }
                 if ui.button("🎨 Categories").clicked() {
                     self.show_categories = true;
@@ -1002,20 +1136,24 @@ impl DiaryApp {
         let p = palette(ui.ctx());
         ui.horizontal(|ui| {
             ui.spacing_mut().interact_size.y = 34.0;
-            if ui.button("◀").clicked() {
+            let timed = self.view != CalView::Photos;
+            if timed && ui.button("◀").clicked() {
                 self.step_calendar(-1);
             }
-            if ui.button("▶").clicked() {
+            if timed && ui.button("▶").clicked() {
                 self.step_calendar(1);
             }
             ui.add_space(6.0);
             ui.label(RichText::new(self.calendar_title()).size(24.0).strong().color(p.title));
             ui.add_space(6.0);
+            if ui.button("Random").on_hover_text("Jump to a random entry from the past (Ctrl+R)").clicked() {
+                self.random_entry();
+            }
             if ui.button("Today").on_hover_text("Jump to today (Ctrl+T)").clicked() {
                 self.go_today();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for (view, label) in [(CalView::Day, "Day"), (CalView::Week, "Week"), (CalView::Month, "Month"), (CalView::Year, "Year")] {
+                for (view, label) in [(CalView::Day, "Day"), (CalView::Week, "Week"), (CalView::Month, "Month"), (CalView::Year, "Year"), (CalView::Photos, "Photos")] {
                     let selected = self.view == view;
                     let mut button = egui::Button::new(RichText::new(label).strong().color(Color32::WHITE));
                     if selected {
@@ -1036,6 +1174,7 @@ impl DiaryApp {
             CalView::Week => week_title(self.selected),
             CalView::Day => self.selected.format("%A %e %B %Y").to_string(),
             CalView::Year => self.selected.year().to_string(),
+            CalView::Photos => "Photos".to_string(),
         }
     }
 
@@ -1071,6 +1210,7 @@ impl DiaryApp {
             }
             CalView::Day => self.day_timeline(ui, &mut ev),
             CalView::Year => self.year_view(ui, &mut ev),
+            CalView::Photos => self.gallery_view(ui),
         }
 
         // Escape cancels a drag in progress.
@@ -1449,6 +1589,9 @@ impl DiaryApp {
             category: e.category.clone(),
             text: e.text.clone(),
             mood: e.mood,
+            pinned: e.pinned,
+            sensitive: e.sensitive,
+            attachments: e.attachments.clone(),
             focus: 0,
             want_focus: Some((usize::MAX, usize::MAX)),
         });
@@ -1503,6 +1646,11 @@ impl DiaryApp {
         let mut edit = None;
         let mut delete = None;
         let mut jump = None;
+        let mut toggle_pin = None;
+        let mut reveal = None;
+        let mut hide = None;
+        let mut save_attachment: Option<Attachment> = None;
+        let mut open_attachment: Option<Attachment> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             if entries.is_empty() {
                 ui.add_space(8.0);
@@ -1511,6 +1659,7 @@ impl DiaryApp {
             for e in &entries {
                 let c = category_color(&self.data.categories, &e.category);
                 let fg = text_on(c);
+                let hidden = e.sensitive && !self.revealed.contains(&e.id);
                 egui::Frame::new()
                     .fill(c)
                     .corner_radius(10)
@@ -1519,21 +1668,62 @@ impl DiaryApp {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&e.category).strong().color(fg));
-                            if let Some(m) = e.mood {
+                            if let Some(m) = e.mood.filter(|_| !hidden) {
                                 mood_badge(ui, m);
                             }
+                            if e.sensitive {
+                                ui.label(RichText::new("Private").small().italics().color(fg));
+                            }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                // Star: pin or unpin this entry.
+                                let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                                paint_star(ui.painter(), r.center(), 9.0, fg, e.pinned);
+                                if resp.on_hover_text(if e.pinned { "Unpin" } else { "Pin this entry" }).clicked() {
+                                    toggle_pin = Some(e.id);
+                                }
                                 let time = e.added_at.get(11..16).unwrap_or("");
                                 ui.label(RichText::new(time).small().color(fg));
                             });
                         });
                         ui.add_space(4.0);
-                        let style = markdown::Style { text: fg, link: fg, size: body };
-                        markdown::render(ui, &e.text, &style, &mut self.media, &self.data.images);
+                        if hidden {
+                            // Stand-in lines where the text would be, and a click to reveal.
+                            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::click());
+                            for (i, width) in [0.95, 0.8, 0.55].iter().enumerate() {
+                                let bar = egui::Rect::from_min_size(
+                                    r.min + vec2(0.0, 4.0 + i as f32 * 16.0),
+                                    vec2(r.width() * width, 10.0),
+                                );
+                                ui.painter().rect_filled(bar, 5.0, fg.gamma_multiply(0.28));
+                            }
+                            ui.painter().text(r.center(), Align2::CENTER_CENTER, "Private entry - click to show", FontId::proportional(15.0), fg);
+                            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                reveal = Some(e.id);
+                            }
+                        } else {
+                            let style = markdown::Style { text: fg, link: fg, size: body };
+                            markdown::render(ui, &e.text, &style, &mut self.media, &self.data.images);
+                            for a in &e.attachments {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("{} ({})", a.name, human_size(a.size))).color(fg));
+                                    if ui.small_button("Save as…").clicked() {
+                                        save_attachment = Some(a.clone());
+                                    }
+                                    if ui.small_button("Open").clicked() {
+                                        open_attachment = Some(a.clone());
+                                    }
+                                });
+                            }
+                        }
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Edit").clicked() {
-                                edit = Some(e.id);
+                            if !hidden {
+                                if ui.button("Edit").clicked() {
+                                    edit = Some(e.id);
+                                }
+                                if e.sensitive && ui.button("Hide").clicked() {
+                                    hide = Some(e.id);
+                                }
                             }
                             if ui.add(egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(RED)).clicked() {
                                 delete = Some(e.id);
@@ -1556,12 +1746,12 @@ impl DiaryApp {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(m.date.get(0..4).unwrap_or("")).strong().color(fg));
-                            if let Some(mood) = m.mood {
+                            if let Some(mood) = m.mood.filter(|_| !m.sensitive) {
                                 mood_badge(ui, mood);
                             }
                             ui.label(RichText::new(m.added_at.get(11..16).unwrap_or("")).small().color(fg));
                         });
-                        let mut s = markdown::summary(&m.text);
+                        let mut s = entry_label(m);
                         if s.chars().count() > 100 {
                             s = s.chars().take(100).collect::<String>() + "…";
                         }
@@ -1588,6 +1778,57 @@ impl DiaryApp {
             self.month = d.with_day(1).unwrap();
             self.day_scroll_pending = true;
         }
+        if let Some(id) = toggle_pin {
+            if let Some(e) = self.data.entries.iter_mut().find(|e| e.id == id) {
+                e.pinned = !e.pinned;
+            }
+            self.persist();
+        }
+        if let Some(id) = reveal {
+            self.revealed.insert(id);
+        }
+        if let Some(id) = hide {
+            self.revealed.remove(&id);
+        }
+        if let Some(a) = save_attachment {
+            self.save_attachment_as(&a);
+        }
+        if let Some(a) = open_attachment {
+            self.open_attachment(&a);
+        }
+    }
+
+    /// The bytes of an attached file, if it is in the diary.
+    fn attachment_bytes(&self, a: &Attachment) -> Option<Vec<u8>> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(self.data.files.get(&a.id)?).ok()
+    }
+
+    fn save_attachment_as(&mut self, a: &Attachment) {
+        let Some(dest) = rfd::FileDialog::new().set_file_name(a.name.clone()).save_file() else { return };
+        self.status = match self.attachment_bytes(a).map(|b| std::fs::write(&dest, b)) {
+            Some(Ok(())) => format!("Saved {}", dest.display()),
+            Some(Err(e)) => format!("Save failed: couldn't write the file ({e})"),
+            None => "Save failed: that attachment is missing from the diary".into(),
+        };
+    }
+
+    /// Write an attached file to a temporary folder and open it with the program Windows picks.
+    /// The temporary copy is not encrypted; the folder is emptied when the diary locks or starts.
+    fn open_attachment(&mut self, a: &Attachment) {
+        let Some(bytes) = self.attachment_bytes(a) else {
+            self.status = "Save failed: that attachment is missing from the diary".into();
+            return;
+        };
+        let dir = open_files_dir();
+        let name: String = a.name.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
+        let path = dir.join(format!("{}-{name}", a.id));
+        match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, bytes)) {
+            Ok(()) => {
+                std::process::Command::new("cmd").args(["/C", "start", ""]).arg(&path).spawn().ok();
+            }
+            Err(e) => self.status = format!("Save failed: couldn't open the file ({e})"),
+        }
     }
 
     /// Replaces the day panel while something is typed in the search box.
@@ -1597,7 +1838,7 @@ impl DiaryApp {
             .data
             .entries
             .iter()
-            .filter(|e| e.text.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q) || e.date.contains(&q))
+            .filter(|e| (!e.sensitive && e.text.to_lowercase().contains(&q)) || e.category.to_lowercase().contains(&q) || e.date.contains(&q))
             .collect();
         hits.sort_by(|a, b| b.added_at.cmp(&a.added_at));
 
@@ -1619,7 +1860,7 @@ impl DiaryApp {
                             ui.label(RichText::new(&e.category).small().color(fg));
                         });
                     });
-                    let mut s = markdown::summary(&e.text);
+                    let mut s = entry_label(e);
                     if s.chars().count() > 110 {
                         s = s.chars().take(110).collect::<String>() + "…";
                     }
@@ -1645,7 +1886,8 @@ impl DiaryApp {
         }
         let p = palette(ctx);
         let dark = ctx.theme() == egui::Theme::Dark;
-        let DiaryApp { editor, data, media, show_marks, editor_msg, save_requested, .. } = self;
+        let DiaryApp { editor, data, media, show_marks, editor_msg, save_requested, focus_mode: focus_flag, .. } = self;
+        let focus_mode = *focus_flag;
         let ed = editor.as_mut().unwrap();
         let mut save_it = false;
         let mut cancel = false;
@@ -1662,25 +1904,39 @@ impl DiaryApp {
         }
         // Images dropped onto the window.
         for file in ctx.input(|i| i.raw.dropped_files.clone()) {
-            match import_image(data, file.path()) {
-                Ok(md) => insert_image(ctx, ed, &md),
-                Err(e) => *editor_msg = e,
+            let path = file.path();
+            if is_image_path(path) {
+                match import_image(data, path) {
+                    Ok(md) => insert_image(ctx, ed, &md),
+                    Err(e) => *editor_msg = e,
+                }
+            } else {
+                match import_attachment(data, path) {
+                    Ok(a) => ed.attachments.push(a),
+                    Err(e) => *editor_msg = e,
+                }
             }
         }
 
-        egui::Window::new(if ed.id.is_some() { "Edit entry" } else { "New entry" })
+        let mut window = egui::Window::new(if ed.id.is_some() { "Edit entry" } else { "New entry" })
             .title_bar(false)
             .frame(popup_frame(&p, dark))
             .resizable(true)
             .default_size([940.0, 620.0])
             .min_size([560.0, 380.0])
             .pivot(Align2::CENTER_CENTER)
-            .default_pos(ctx.content_rect().center())
-            .show(ctx, |ui| {
+            .default_pos(ctx.content_rect().center());
+        if focus_mode {
+            // Fill the whole window for distraction-free writing.
+            let r = ctx.content_rect();
+            window = window.fixed_pos(r.min).fixed_size(r.size()).pivot(Align2::LEFT_TOP).resizable(false);
+        }
+        window.show(ctx, |ui| {
                 if popup_header(ui, &p, if ed.id.is_some() { "Edit entry" } else { "New entry" }) {
                     cancel = true;
                 }
                 egui::Frame::new().inner_margin(14).show(ui, |ui| {
+                    if !focus_mode {
                     // Day, time and category.
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Date:");
@@ -1726,6 +1982,9 @@ impl DiaryApp {
                                 ed.mood = if on { None } else { Some(m) };
                             }
                         }
+                        ui.add_space(10.0);
+                        ui.checkbox(&mut ed.pinned, "Pinned").on_hover_text("List this entry under Pinned and star it on the calendar");
+                        ui.checkbox(&mut ed.sensitive, "Private").on_hover_text("Hide this entry until you click it");
                     });
                     ui.add_space(6.0);
 
@@ -1764,18 +2023,63 @@ impl DiaryApp {
                                 }
                             }
                         }
+                        if ui.button("Attach file…").on_hover_text("Attach any file (up to 25 MB), or drop one onto this window").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                match import_attachment(data, &path) {
+                                    Ok(a) => {
+                                        ed.attachments.push(a);
+                                        editor_msg.clear();
+                                    }
+                                    Err(e) => *editor_msg = e,
+                                }
+                            }
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.checkbox(show_marks, "Show formatting marks");
+                            if ui.button("Focus").on_hover_text("Distraction-free writing (F11)").clicked() {
+                                *focus_flag = true;
+                            }
                         });
                     });
                     if !editor_msg.is_empty() {
                         ui.label(RichText::new(editor_msg.as_str()).color(Color32::from_rgb(239, 68, 68)));
                     }
+                    if !ed.attachments.is_empty() {
+                        ui.add_space(4.0);
+                        let mut remove = None;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Attachments:").color(p.muted));
+                            for (i, a) in ed.attachments.iter().enumerate() {
+                                egui::Frame::new().fill(p.head_bg).corner_radius(8).inner_margin(egui::Margin::symmetric(8, 3)).show(ui, |ui| {
+                                    ui.label(RichText::new(format!("{} ({})", a.name, human_size(a.size))).color(p.head_text));
+                                    let x = egui::Button::new(RichText::new("Remove").small().color(Color32::WHITE)).fill(RED);
+                                    if ui.add(x).clicked() {
+                                        remove = Some(i);
+                                    }
+                                });
+                            }
+                        });
+                        if let Some(i) = remove {
+                            ed.attachments.remove(i);
+                        }
+                    }
                     ui.add_space(6.0);
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("Focus mode  ·  {}", ed.date.format("%A %e %B %Y"))).color(p.muted));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Leave focus mode").on_hover_text("Esc or F11").clicked() {
+                                    *focus_flag = false;
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
 
                     // The page: styled text blocks, with pictures shown in between.
-                    let height = (ui.available_height() - 52.0).max(120.0);
-                    let body = ui.style().text_styles[&egui::TextStyle::Body].size;
+                    let mut page = |ui: &mut egui::Ui| {
+                    let height = (ui.available_height() - if focus_mode { 0.0 } else { 52.0 }).max(120.0);
+                    let body = ui.style().text_styles[&egui::TextStyle::Body].size * if focus_mode { 1.2 } else { 1.0 };
                     let st = live::LiveStyle { ink: p.ink, muted: p.muted, accent: p.accent, size: body };
                     let marks = *show_marks;
                     egui::Frame::new().fill(p.cell).stroke(Stroke::new(1.0, p.cell_border)).inner_margin(10).show(ui, |ui| {
@@ -1869,6 +2173,23 @@ impl DiaryApp {
                             }
                         });
                     });
+                    };
+                    if focus_mode {
+                        let area = vec2(ui.available_width(), (ui.available_height() - 52.0).max(160.0));
+                        ui.allocate_ui(area, |ui| {
+                            egui_extras::StripBuilder::new(ui)
+                                .size(egui_extras::Size::remainder())
+                                .size(egui_extras::Size::exact(860.0))
+                                .size(egui_extras::Size::remainder())
+                                .horizontal(|mut strip| {
+                                    strip.empty();
+                                    strip.cell(|ui| page(ui));
+                                    strip.empty();
+                                });
+                        });
+                    } else {
+                        page(ui);
+                    }
 
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -1906,6 +2227,7 @@ impl DiaryApp {
 
         if save_it {
             let ed = self.editor.take().unwrap();
+            self.focus_mode = false;
             let text = ed.text.trim().to_string();
             let added_at = format!("{} {:02}:{:02}:{:02}", key(ed.date), ed.hour, ed.minute, ed.second);
             match ed.id {
@@ -1916,11 +2238,14 @@ impl DiaryApp {
                         e.date = key(ed.date);
                         e.added_at = added_at;
                         e.mood = ed.mood;
+                        e.pinned = ed.pinned;
+                        e.sensitive = ed.sensitive;
+                        e.attachments = ed.attachments;
                     }
                 }
                 None => {
                     let id = self.data.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-                    self.data.entries.push(Entry { id, date: key(ed.date), added_at, category: ed.category, text, mood: ed.mood });
+                    self.data.entries.push(Entry { id, date: key(ed.date), added_at, category: ed.category, text, mood: ed.mood, pinned: ed.pinned, sensitive: ed.sensitive, attachments: ed.attachments, ..Default::default() });
                 }
             }
             self.selected = ed.date;
@@ -1929,6 +2254,7 @@ impl DiaryApp {
             self.persist();
         } else if cancel {
             self.editor = None;
+            self.focus_mode = false;
             self.editor_msg.clear();
 
         }
@@ -2108,7 +2434,10 @@ fn setup_fonts(ctx: &egui::Context) {
 fn setup_style(ctx: &egui::Context) {
     setup_fonts(ctx);
     // Follow the system light/dark setting.
-    ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::System);
+    ctx.options_mut(|o| {
+        o.theme_preference = egui::ThemePreference::System;
+        o.zoom_with_keyboard = false; // the app has its own, saved, text size
+    });
     ctx.set_visuals_of(egui::Theme::Light, make_visuals(false));
     ctx.set_visuals_of(egui::Theme::Dark, make_visuals(true));
     ctx.global_style_mut(|s| {
@@ -2139,6 +2468,28 @@ impl eframe::App for DiaryApp {
                 }
             }
         }
+        // Interface zoom (the saved text-size setting).
+        if self.lock.is_none() {
+            let scale = self.data.settings.ui_scale.clamp(0.7, 2.0);
+            if (ctx.zoom_factor() - scale).abs() > 0.001 {
+                ctx.set_zoom_factor(scale);
+            }
+        }
+        // Privacy screen: hide everything while the window is not the active one.
+        if self.lock.is_none() && self.data.settings.privacy_screen {
+            let (focused, minimized) = ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().minimized.unwrap_or(false)));
+            if !focused || minimized {
+                self.revealed.clear();
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(p.page_bg)).show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space((ui.available_height() / 2.0 - 50.0).max(20.0));
+                        ui.label(RichText::new("My Diary").size(34.0).strong().color(p.title));
+                        ui.label(RichText::new("Hidden while this window is in the background. Click here to show it again.").color(p.muted));
+                    });
+                });
+                return;
+            }
+        }
         self.handle_shortcuts(&ctx);
         if self.lock.is_some() {
             egui::Panel::top("header")
@@ -2167,13 +2518,16 @@ impl eframe::App for DiaryApp {
         self.password_window(&ctx);
         self.location_window(&ctx);
         self.shortcuts_window(&ctx);
+        self.insights_window(&ctx);
+        self.lightbox_window(&ctx);
+        self.pinned_window(&ctx);
         self.export_window(&ctx);
     }
 }
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_icon(std::sync::Arc::new(egui::IconData { rgba: icon::rgba(256), width: 256, height: 256 })).with_inner_size([1150.0, 720.0]).with_min_inner_size([1000.0, 560.0]),
+        viewport: egui::ViewportBuilder::default().with_icon(std::sync::Arc::new(egui::IconData { rgba: icon::rgba(256), width: 256, height: 256 })).with_inner_size([1280.0, 760.0]).with_min_inner_size([1200.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -2357,6 +2711,9 @@ mod tests {
             category: "Personal".into(),
             text: text.into(),
             mood: None,
+            pinned: false,
+            sensitive: false,
+            attachments: Vec::new(),
             focus: 0,
             want_focus: None,
         }
@@ -2455,6 +2812,7 @@ mod tests {
                 category: "Work".into(),
                 text: text.into(),
                 mood: None,
+                ..Default::default()
             });
         }
         app.data.entries[0].mood = Some(4);
@@ -2588,6 +2946,216 @@ mod tests {
         let report = export::Report { title: "T".into(), subtitle: "S".into(), entries, include_images: true };
         assert!(export::build_pdf(&report, &app.data.categories, &app.data.images).unwrap().starts_with(b"%PDF"));
     }
+
+    #[test]
+    fn diaries_from_earlier_versions_still_load() {
+        // No pinned / private / attachments / files / zoom / privacy settings in this file.
+        let old = r#"{
+            "categories": [{"name": "Personal", "color": [96, 165, 250]}],
+            "entries": [{"id": 1, "date": "2026-10-08", "added_at": "2026-10-08 16:11:27", "category": "Personal", "text": "hi"}],
+            "settings": {"auto_lock_minutes": 5, "daily_word_goal": 100}
+        }"#;
+        let data: Data = serde_json::from_str(old).unwrap();
+        let e = &data.entries[0];
+        assert!(!e.pinned && !e.sensitive && e.attachments.is_empty() && e.mood.is_none());
+        assert!(data.files.is_empty() && data.images.is_empty());
+        assert_eq!((data.settings.auto_lock_minutes, data.settings.daily_word_goal), (5, 100));
+        assert_eq!(data.settings.ui_scale, 1.0);
+        assert!(data.settings.privacy_screen, "the privacy screen is on unless turned off");
+    }
+
+    #[test]
+    fn private_entries_are_masked_in_lists() {
+        let mut e = Entry { text: "# Secret plans".into(), ..Default::default() };
+        assert_eq!(entry_label(&e), "Secret plans");
+        e.sensitive = true;
+        assert_eq!(entry_label(&e), "Private entry");
+        assert_eq!(human_size(10), "10 B");
+        assert_eq!(human_size(2048), "2 KB");
+        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[test]
+    fn attachments_are_stored_limited_and_cleaned_up() {
+        let dir = std::env::temp_dir().join(format!("diary-att-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "hello attachment").unwrap();
+
+        let mut app = app_with_entries();
+        let att = import_attachment(&mut app.data, &file).unwrap();
+        assert_eq!((att.name.as_str(), att.size), ("notes.txt", 16));
+        assert_eq!(app.attachment_bytes(&att).unwrap(), b"hello attachment");
+        assert!(import_attachment(&mut app.data, &dir.join("missing.bin")).is_err());
+
+        // An attachment on no entry is dropped when the diary is next saved; one in use is kept.
+        let id = att.id.clone();
+        app.persist();
+        assert!(!app.data.files.contains_key(&id), "unused files are dropped");
+        let att = import_attachment(&mut app.data, &file).unwrap();
+        app.data.entries[0].attachments.push(att.clone());
+        app.persist();
+        assert!(app.data.files.contains_key(&att.id), "files in use are kept");
+        assert!(is_image_path(std::path::Path::new("a/b/Photo.JPG")) && !is_image_path(std::path::Path::new("notes.txt")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn text_size_steps_and_is_remembered() {
+        let mut app = app_with_entries();
+        assert_eq!(app.data.settings.ui_scale, 1.0);
+        app.step_zoom(1);
+        assert_eq!(app.data.settings.ui_scale, 1.1);
+        app.step_zoom(1);
+        app.step_zoom(1);
+        assert_eq!(app.data.settings.ui_scale, 1.4);
+        for _ in 0..10 {
+            app.step_zoom(1);
+        }
+        assert_eq!(app.data.settings.ui_scale, 1.6, "stops at the largest size");
+        for _ in 0..10 {
+            app.step_zoom(-1);
+        }
+        assert_eq!(app.data.settings.ui_scale, 0.8, "and at the smallest");
+    }
+
+    #[test]
+    fn random_entry_skips_private_ones() {
+        let mut app = app_with_entries();
+        for e in &mut app.data.entries {
+            e.sensitive = true;
+        }
+        app.data.entries[3].sensitive = false; // the entry on 2026-10-12
+        let today = Local::now().date_naive();
+        for _ in 0..20 {
+            app.selected = today;
+            app.random_entry();
+            assert_eq!(app.selected, d(2026, 10, 12), "only the one public entry can be picked");
+        }
+        app.data.entries[3].sensitive = true;
+        app.random_entry();
+        assert!(app.status.contains("no entries"), "{}", app.status);
+    }
+
+    #[test]
+    fn photos_are_listed_newest_first_and_private_ones_flagged() {
+        assert_eq!(
+            markdown::images("a ![one](img:i1) b\n\n![two words](img:i2) ![web](http://x/y.png)"),
+            vec![("i1".to_string(), "one".to_string()), ("i2".to_string(), "two words".to_string())]
+        );
+        let images = BTreeMap::from([("i1".to_string(), "x".to_string()), ("i2".to_string(), "x".to_string())]);
+        let entries = vec![
+            Entry { id: 1, date: "2026-10-01".into(), added_at: "2026-10-01 09:00:00".into(), text: "![old](img:i1)".into(), ..Default::default() },
+            Entry { id: 2, date: "2026-10-05".into(), added_at: "2026-10-05 09:00:00".into(), text: "![new](img:i2) ![gone](img:i9)".into(), sensitive: true, ..Default::default() },
+        ];
+        let photos = gallery::collect_photos(&entries, &images);
+        assert_eq!(photos.iter().map(|p| (p.id.as_str(), p.private)).collect::<Vec<_>>(), vec![("i2", true), ("i1", false)]);
+        assert_eq!(photos[0].caption, "new");
+    }
+
+    #[test]
+    fn cards_gallery_and_viewer_render_with_every_kind_of_entry() {
+        let dir = std::env::temp_dir().join(format!("diary-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tiny_png(&dir.join("a.png"), 255);
+        let ctx = egui::Context::default();
+        setup_style(&ctx);
+        let mut app = app_with_entries();
+        let picture = import_image(&mut app.data, &dir.join("a.png")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        app.data.entries[0].text = format!("Hello {picture}");
+        app.data.entries[0].pinned = true;
+        app.data.entries[1].sensitive = true;
+        app.data.entries[2].attachments.push(Attachment { id: "f1".into(), name: "a.pdf".into(), size: 1500 });
+        app.rev += 1;
+
+        for view in [CalView::Month, CalView::Day, CalView::Photos] {
+            app.view = view;
+            for _ in 0..3 {
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    app.calendar(ui);
+                    app.day_panel(ui);
+                });
+                out.textures_delta.clear();
+            }
+        }
+        // Private entries open when clicked; the viewer and the pinned list render too.
+        app.revealed.insert(app.data.entries[1].id);
+        app.lightbox = Some(0);
+        app.show_pinned = true;
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.day_panel(ui);
+                app.lightbox_window(ui.ctx());
+                app.pinned_window(ui.ctx());
+            });
+            out.textures_delta.clear();
+        }
+        assert_eq!(app.lightbox, Some(0), "the viewer stays open");
+    }
+
+    #[test]
+    fn insights_window_renders_every_tab_range_and_period() {
+        let ctx = egui::Context::default();
+        setup_style(&ctx);
+        let mut app = app_with_entries();
+        for (i, e) in app.data.entries.iter_mut().enumerate() {
+            e.mood = Some(1 + (i as u8 % 5));
+        }
+        app.insights.open = true;
+        for tab in [insights::Tab::Mood, insights::Tab::Writing, insights::Tab::Review] {
+            for range in 0..4 {
+                for period in 0..6 {
+                    app.insights.tab = tab;
+                    app.insights.range = range;
+                    app.insights.period = period;
+                    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| app.insights_window(ui.ctx()));
+                    out.textures_delta.clear();
+                }
+            }
+        }
+        assert!(app.insights.open);
+        app.insights.clear();
+        assert!(!app.insights.open);
+    }
+
+    #[test]
+    fn a_review_can_be_saved_as_a_pdf() {
+        let dir = std::env::temp_dir().join(format!("diary-review-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tiny_png(&dir.join("a.png"), 255);
+        let mut app = app_with_entries();
+        let picture = import_image(&mut app.data, &dir.join("a.png")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        app.data.entries[0].text = format!("# A good morning\n\nWent for a **long** run by the river. {picture}");
+        app.data.entries[0].mood = Some(5);
+        app.data.entries[1].mood = Some(2);
+        app.data.entries[0].pinned = true;
+        let per_day = stats::per_day(&app.data.entries);
+        let review = reports::review(&app.data.entries, &per_day, &app.data.images, reports::Period::ThisMonth, d(2026, 10, 9), 5);
+        assert_eq!(review.summary.entries, 4);
+        assert_eq!(review.pictures.len(), 1);
+        for include_images in [true, false] {
+            let pdf = export::build_review_pdf(&review, &app.data.categories, &app.data.images, include_images).unwrap();
+            assert!(pdf.starts_with(b"%PDF") && pdf.len() > 2000);
+            if let (Some(dir), true) = (std::env::var_os("DIARY_PDF_OUT"), include_images) {
+                std::fs::write(std::path::Path::new(&dir).join("review.pdf"), &pdf).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn exports_leave_out_private_entries_unless_asked() {
+        let mut app = app_with_entries();
+        app.data.entries[1].sensitive = true;
+        let (from, to, ..) = app.export_range(ExportScope::Year);
+        assert_eq!(app.entries_in(from, to).len(), 3);
+        app.export_private = true;
+        assert_eq!(app.entries_in(from, to).len(), 4);
+        app.data.entries[0].attachments.push(Attachment { id: "f1".into(), name: "report.pdf".into(), size: 2048 });
+        let report = export::Report { title: "T".into(), subtitle: "S".into(), entries: app.entries_in(from, to), include_images: false };
+        assert!(export::build_pdf(&report, &app.data.categories, &app.data.images).unwrap().starts_with(b"%PDF"));
+    }
     #[test]
     fn all_calendar_views_render() {
         let ctx = egui::Context::default();
@@ -2686,6 +3254,7 @@ enum CalView {
     Month,
     Week,
     Year,
+    Photos,
     Day,
 }
 
@@ -2744,14 +3313,15 @@ fn pill(
     let c = category_color(cats, &e.category);
     let resp = ui.interact(rect, ui.id().with(("pill", e.id)), Sense::click_and_drag());
     let being_dragged = *drag == Some(e.id);
-    let label = format!("{} {}", e.added_at.get(11..16).unwrap_or(""), markdown::summary(&e.text));
+    let label = format!("{} {}", e.added_at.get(11..16).unwrap_or(""), entry_label(e));
     let fg = text_on(c);
 
     painter.rect_filled(rect, 9.0, if being_dragged { c.gamma_multiply(0.3) } else { c });
     if resp.hovered() && !being_dragged {
         painter.rect_stroke(rect, 9.0, Stroke::new(1.5, fg), egui::StrokeKind::Inside);
     }
-    painter.with_clip_rect(rect.shrink2(vec2(4.0, 0.0))).text(
+    let text_area = egui::Rect::from_min_max(rect.min + vec2(4.0, 0.0), rect.max - vec2(if e.pinned { 24.0 } else { 4.0 }, 0.0));
+    painter.with_clip_rect(text_area).text(
         egui::pos2(rect.min.x + 7.0, rect.center().y),
         Align2::LEFT_CENTER,
         &label,
@@ -2762,6 +3332,9 @@ fn pill(
         ui.ctx().set_cursor_icon(if being_dragged { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
     }
 
+    if e.pinned {
+        paint_star(painter, egui::pos2(rect.max.x - 13.0, rect.center().y), 6.0, fg, true);
+    }
     if resp.drag_started() {
         *drag = Some(e.id);
     }
@@ -2868,4 +3441,85 @@ enum ExportScope {
     Month,
     Year,
     All,
+}
+
+/// A file attached to an entry.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct Attachment {
+    id: String,
+    name: String,
+    /// Size in bytes.
+    size: u64,
+}
+
+const MAX_ATTACHMENT: u64 = 25 * 1024 * 1024;
+
+fn human_size(bytes: u64) -> String {
+    match bytes {
+        0..=1023 => format!("{bytes} B"),
+        1024..=1_048_575 => format!("{:.0} KB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
+    }
+}
+
+fn is_image_path(path: &std::path::Path) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    ["png", "jpg", "jpeg", "gif", "bmp", "webp"].contains(&ext.as_str())
+}
+
+/// Read a file into the diary's attachment store. The file is kept inside the encrypted diary.
+fn import_attachment(data: &mut Data, path: &std::path::Path) -> Result<Attachment, String> {
+    use base64::Engine;
+    let size = std::fs::metadata(path).map_err(|e| format!("Couldn't read {}: {e}", path.display()))?.len();
+    if size > MAX_ATTACHMENT {
+        return Err(format!("That file is {}; attachments can be up to {}.", human_size(size), human_size(MAX_ATTACHMENT)));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("Couldn't read {}: {e}", path.display()))?;
+    let mut id = format!("f{}", chrono::Utc::now().timestamp_millis());
+    while data.files.contains_key(&id) {
+        id.push('x');
+    }
+    data.files.insert(id.clone(), base64::engine::general_purpose::STANDARD.encode(&bytes));
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    Ok(Attachment { id, name, size })
+}
+
+/// Where attachments are written when they are opened.
+fn open_files_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("VibeDiary-open")
+}
+
+/// Delete the temporary copies made by "Open".
+fn clear_open_files() {
+    std::fs::remove_dir_all(open_files_dir()).ok();
+}
+
+/// A five-pointed star: filled, or just an outline.
+fn paint_star(painter: &egui::Painter, center: egui::Pos2, r: f32, color: Color32, filled: bool) {
+    let points: Vec<egui::Pos2> = (0..10)
+        .map(|i| {
+            let angle = std::f32::consts::FRAC_PI_2 * -1.0 + i as f32 * std::f32::consts::PI / 5.0;
+            let radius = if i % 2 == 0 { r } else { r * 0.42 };
+            center + vec2(angle.cos(), angle.sin()) * radius
+        })
+        .collect();
+    if filled {
+        let gold = Color32::from_rgb(250, 190, 20);
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(center, gold);
+        for p in &points {
+            mesh.colored_vertex(*p, gold);
+        }
+        for i in 0..10u32 {
+            mesh.add_triangle(0, 1 + i, 1 + (i + 1) % 10);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    painter.add(egui::Shape::closed_line(points, Stroke::new(1.4, if filled { Color32::from_rgb(150, 100, 0) } else { color })));
+}
+
+/// What to show of an entry in lists and on the calendar: its first line, or a placeholder for
+/// private entries.
+fn entry_label(e: &Entry) -> String {
+    if e.sensitive { "Private entry".into() } else { markdown::summary(&e.text) }
 }

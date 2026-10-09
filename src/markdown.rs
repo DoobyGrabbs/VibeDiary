@@ -250,6 +250,26 @@ pub fn image_ids(md: &str) -> Vec<String> {
         .collect()
 }
 
+/// The pictures in an entry, as (id, caption) pairs in order.
+pub fn images(md: &str) -> Vec<(String, String)> {
+    let (mut found, mut current): (Vec<(String, String)>, Option<(String, String)>) = (Vec::new(), None);
+    for event in Parser::new(md) {
+        match event {
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                current = dest_url.strip_prefix(IMAGE_SCHEME).map(|id| (id.to_string(), String::new()));
+            }
+            Event::Text(t) | Event::Code(t) => {
+                if let Some((_, alt)) = current.as_mut() {
+                    alt.push_str(&t);
+                }
+            }
+            Event::End(TagEnd::Image) => found.extend(current.take()),
+            _ => {}
+        }
+    }
+    found
+}
+
 // ---------------------------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------------------------
@@ -264,10 +284,11 @@ pub struct Style {
 #[derive(Default)]
 pub struct Media {
     textures: HashMap<String, Option<TextureHandle>>,
+    thumbs: HashMap<String, Option<TextureHandle>>,
 }
 
 impl Media {
-    fn texture(&mut self, ctx: &egui::Context, images: &BTreeMap<String, String>, id: &str) -> Option<TextureHandle> {
+    pub fn texture(&mut self, ctx: &egui::Context, images: &BTreeMap<String, String>, id: &str) -> Option<TextureHandle> {
         self.textures
             .entry(id.to_string())
             .or_insert_with(|| {
@@ -276,6 +297,20 @@ impl Media {
                 let size = [img.width() as usize, img.height() as usize];
                 let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
                 Some(ctx.load_texture(format!("diary-{id}"), color, TextureOptions::LINEAR))
+            })
+            .clone()
+    }
+
+    /// A small (up to 256 px) version of a picture, for the gallery.
+    pub fn thumbnail(&mut self, ctx: &egui::Context, images: &BTreeMap<String, String>, id: &str) -> Option<TextureHandle> {
+        self.thumbs
+            .entry(id.to_string())
+            .or_insert_with(|| {
+                let bytes = B64.decode(images.get(id)?).ok()?;
+                let img = image::load_from_memory(&bytes).ok()?.thumbnail(256, 256).to_rgba8();
+                let size = [img.width() as usize, img.height() as usize];
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+                Some(ctx.load_texture(format!("diary-thumb-{id}"), color, TextureOptions::LINEAR))
             })
             .clone()
     }
@@ -644,4 +679,21 @@ mod word_tests {
         assert_eq!(word_count("![a long picture name](img:i1)\n\nafter"), 1);
         assert_eq!(word_count("line one\nline two"), 4);
     }
+}
+
+/// An entry as plain text: no marks, no picture names, one space between blocks.
+pub fn plain_text(md: &str) -> String {
+    let mut out = String::new();
+    let mut in_image = false;
+    for event in Parser::new(md) {
+        match event {
+            Event::Start(Tag::Image { .. }) => in_image = true,
+            Event::End(TagEnd::Image) => in_image = false,
+            Event::Text(t) | Event::Code(t) if !in_image => out.push_str(&t),
+            Event::SoftBreak | Event::HardBreak => out.push(' '),
+            Event::End(_) => out.push(' '),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }

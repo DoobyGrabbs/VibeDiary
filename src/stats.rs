@@ -89,7 +89,7 @@ pub fn longest_streak(days: &BTreeSet<NaiveDate>) -> u32 {
     best
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Clone)]
 pub struct Summary {
     pub entries: usize,
     pub days_written: usize,
@@ -177,7 +177,7 @@ mod tests {
     }
 
     fn entry(id: u64, date: &str, cat: &str, text: &str, mood: Option<u8>) -> Entry {
-        Entry { id, date: date.into(), added_at: format!("{date} 10:00:00"), category: cat.into(), text: text.into(), mood }
+        Entry { id, date: date.into(), added_at: format!("{date} 10:00:00"), category: cat.into(), text: text.into(), mood, ..Default::default() }
     }
 
     fn set(dates: &[(i32, u32, u32)]) -> BTreeSet<NaiveDate> {
