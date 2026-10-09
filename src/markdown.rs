@@ -336,19 +336,7 @@ fn render_inlines(
         match inl {
             Inline::Image { src, alt } => {
                 flush(ui, &mut run);
-                let tex = src.strip_prefix(IMAGE_SCHEME).and_then(|id| media.texture(ui.ctx(), images, id));
-                match tex {
-                    Some(tex) => {
-                        let natural = tex.size_vec2();
-                        let scale = (ui.available_width() / natural.x).min(520.0 / natural.y).min(1.0);
-                        ui.add_space(2.0);
-                        ui.image((tex.id(), natural * scale));
-                        ui.add_space(2.0);
-                    }
-                    None => {
-                        ui.add(Label::new(egui::RichText::new(format!("[missing image: {alt}]")).color(style.text)));
-                    }
-                }
+                show_image(ui, media, images, src, alt, style.text);
             }
             other => run.push(other.clone()),
         }
@@ -602,5 +590,29 @@ mod tests {
         let mut s = "héllo wörld".to_string();
         apply(&mut s, (6, 11), Format::Code);
         assert_eq!(s, "héllo `wörld`");
+    }
+}
+
+/// Show the picture `src` (`img:ID`), scaled to fit; a note is shown if it can't be found.
+pub fn show_image(
+    ui: &mut egui::Ui,
+    media: &mut Media,
+    images: &BTreeMap<String, String>,
+    src: &str,
+    alt: &str,
+    text: Color32,
+) {
+    let tex = src.strip_prefix(IMAGE_SCHEME).and_then(|id| media.texture(ui.ctx(), images, id));
+    match tex {
+        Some(tex) => {
+            let natural = tex.size_vec2();
+            let scale = (ui.available_width() / natural.x).min(520.0 / natural.y).min(1.0);
+            ui.add_space(2.0);
+            ui.image((tex.id(), natural * scale));
+            ui.add_space(2.0);
+        }
+        None => {
+            ui.add(Label::new(egui::RichText::new(format!("[missing image: {alt}]")).color(text)));
+        }
     }
 }

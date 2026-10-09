@@ -8,8 +8,8 @@ Write down your thoughts each day with rich formatting and pictures, tag them wi
 
 - **Month calendar** with each day's entries shown as coloured pills (time + first line of the entry).
 - **Multiple entries per day**, each with a time. You can change an entry's date and time when you edit it.
-- **Rich text editor** (Markdown-based) with a formatting toolbar and a live preview: bold, italic, strikethrough, code, three heading sizes, bulleted and numbered lists and quotes. `Ctrl+B` and `Ctrl+I` work too.
-- **Pictures**: add images with the **Image** button or by dropping a file onto the editor. Large images are shrunk (longest side 1600 px) and stored inside the encrypted diary.
+- **WYSIWYG rich text editor** (Markdown underneath): type in a single page where bold looks bold, headings are large and the Markdown marks disappear. The marks show on the line your cursor is on, or everywhere with "Show formatting marks". A toolbar offers bold, italic, strikethrough, code, three heading sizes, bulleted and numbered lists and quotes; `Ctrl+B` and `Ctrl+I` work too.
+- **Pictures** appear in the page where you put them. Add them with the **Image** button or by dropping a file onto the editor, and remove them with the button under each one. Large images are shrunk (longest side 1600 px) and stored inside the encrypted diary.
 - **Categories** with their own colours. Add, rename, recolour and delete them from the Categories window. Renaming a category updates the entries that use it.
 - **Search** across all entries from the box in the header; click a result to jump to its day.
 - **Password protection.** The diary is encrypted with a password you choose, and the app asks for it every time it starts. **Lock** locks it immediately; **Menu → Change password** changes it.
@@ -25,7 +25,7 @@ Write down your thoughts each day with rich formatting and pictures, tag them wi
 | Select a day | Click it on the calendar |
 | New entry | Double-click a day, or use **New entry** / **Add entry for this day** |
 | Edit or delete an entry | Use the buttons on its card in the day panel |
-| Format text | Select text and use the toolbar buttons (click again to remove the format) |
+| Format text | Select text and use the toolbar buttons or shortcuts (click again to remove the format), or type Markdown such as `**bold**` or `# Heading` |
 | Add a picture | **Image…** in the editor, or drop an image file onto the editor |
 | Change month | **◀** / **▶** in the header, or **Today** to jump back |
 | Search | Type in the search box; clear it to go back to the day view |
@@ -84,7 +84,8 @@ Once decrypted, the data looks like this:
 ## Project layout
 
 - `src/main.rs` contains the application: the UI, lock screen, editor and file handling.
-- `src/markdown.rs` parses and renders entries and holds the toolbar's text-formatting logic.
+- `src/markdown.rs` parses and renders entries for display and holds the toolbar's text-formatting logic.
+- `src/live.rs` styles the text as you type (the WYSIWYG layout) and splits an entry into text and picture blocks.
 - `src/vault.rs` contains the password-based encryption.
 - `src/icon.rs` draws the app icon; `build.rs` turns it into the `.exe` icon.
 - `Cargo.toml` lists the dependencies: `eframe`/`egui_extras` (UI), `chrono`/`jiff` (dates), `serde`/`serde_json`, `pulldown-cmark` (Markdown), `image` (pictures), `rfd` (file dialogs), `argon2`/`chacha20poly1305`/`base64`/`getrandom` (encryption), and `winresource` (build only).

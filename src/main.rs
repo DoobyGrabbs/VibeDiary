@@ -6,6 +6,7 @@ use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke, vec2}
 use serde::{Deserialize, Serialize};
 
 mod icon;
+mod live;
 mod markdown;
 mod vault;
 
@@ -220,6 +221,10 @@ struct EditState {
     second: u32,
     category: String,
     text: String,
+    /// Index of the text block that last had the cursor (target of toolbar actions).
+    focus: usize,
+    /// Move the cursor here next frame: (text block index, char position); `usize::MAX` = last / end.
+    want_focus: Option<(usize, usize)>,
 }
 
 #[derive(Clone)]
@@ -282,7 +287,7 @@ struct DiaryApp {
     pw_error: String,
     status: String,
     media: markdown::Media,
-    show_preview: bool,
+    show_marks: bool,
     search: String,
     last_activity: std::time::Instant,
     /// Images used by an unsaved draft, kept while the diary is locked.
@@ -317,7 +322,7 @@ impl DiaryApp {
             pw_error: String::new(),
             status: String::new(),
             media: markdown::Media::default(),
-            show_preview: true,
+            show_marks: false,
             search: String::new(),
             last_activity: std::time::Instant::now(),
             draft_images: BTreeMap::new(),
@@ -552,6 +557,8 @@ impl DiaryApp {
             second: now.second(),
             category,
             text: String::new(),
+            focus: 0,
+            want_focus: Some((usize::MAX, usize::MAX)),
         });
     }
 
@@ -813,6 +820,8 @@ impl DiaryApp {
                     second: time.second(),
                     category: e.category.clone(),
                     text: e.text.clone(),
+                    focus: 0,
+                    want_focus: Some((usize::MAX, usize::MAX)),
                 });
                 self.editor_msg.clear();
             }
@@ -878,8 +887,7 @@ impl DiaryApp {
         }
         let p = palette(ctx);
         let dark = ctx.theme() == egui::Theme::Dark;
-        let text_id = egui::Id::new("entry_text");
-        let DiaryApp { editor, data, media, show_preview, editor_msg, .. } = self;
+        let DiaryApp { editor, data, media, show_marks, editor_msg, .. } = self;
         let ed = editor.as_mut().unwrap();
         let mut save_it = false;
         let mut cancel = false;
@@ -888,13 +896,13 @@ impl DiaryApp {
         let shortcuts = [(egui::Key::B, markdown::Format::Bold), (egui::Key::I, markdown::Format::Italic)];
         for (key, format) in shortcuts {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, key)) {
-                format_selection(ctx, text_id, &mut ed.text, format);
+                apply_format(ctx, ed, format);
             }
         }
         // Images dropped onto the window.
         for file in ctx.input(|i| i.raw.dropped_files.clone()) {
             match import_image(data, file.path()) {
-                Ok(md) => insert_at_cursor(ctx, text_id, &mut ed.text, &md),
+                Ok(md) => insert_image(ctx, ed, &md),
                 Err(e) => *editor_msg = e,
             }
         }
@@ -963,7 +971,7 @@ impl DiaryApp {
                         ];
                         for (label, tip, format) in buttons {
                             if ui.button(label).on_hover_text(tip).clicked() {
-                                format_selection(ctx, text_id, &mut ed.text, format);
+                                apply_format(ctx, ed, format);
                             }
                         }
                         ui.add_space(8.0);
@@ -974,7 +982,7 @@ impl DiaryApp {
                             if let Some(path) = picked {
                                 match import_image(data, &path) {
                                     Ok(md) => {
-                                        insert_at_cursor(ctx, text_id, &mut ed.text, &md);
+                                        insert_image(ctx, ed, &md);
                                         editor_msg.clear();
                                     }
                                     Err(e) => *editor_msg = e,
@@ -982,7 +990,7 @@ impl DiaryApp {
                             }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.checkbox(show_preview, "Live preview");
+                            ui.checkbox(show_marks, "Show formatting marks");
                         });
                     });
                     if !editor_msg.is_empty() {
@@ -990,39 +998,102 @@ impl DiaryApp {
                     }
                     ui.add_space(6.0);
 
-                    // Editor (and preview).
+                    // The page: styled text blocks, with pictures shown in between.
                     let height = (ui.available_height() - 52.0).max(120.0);
                     let body = ui.style().text_styles[&egui::TextStyle::Body].size;
-                    let edit_pane = |ui: &mut egui::Ui, text: &mut String| {
-                        egui::ScrollArea::vertical().id_salt("edit_scroll").auto_shrink([false, false]).max_height(height).show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(text)
-                                    .id(text_id)
-                                    .hint_text("What's on your mind?")
-                                    .text_color(p.ink)
-                                    .desired_width(f32::INFINITY)
-                                    .min_size(vec2(0.0, height - 8.0)),
-                            );
+                    let st = live::LiveStyle { ink: p.ink, muted: p.muted, accent: p.accent, size: body };
+                    let marks = *show_marks;
+                    egui::Frame::new().fill(p.cell).stroke(Stroke::new(1.0, p.cell_border)).inner_margin(10).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical().id_salt("edit_scroll").auto_shrink([false, false]).max_height(height - 24.0).show(ui, |ui| {
+                            let mut segs = live::split(&ed.text);
+                            let count = segs.len();
+                            let is_text: Vec<bool> = segs.iter().map(|s| matches!(s, live::Seg::Text(_))).collect();
+                            let mut changed = false;
+                            let mut remove = None;
+                            for i in 0..count {
+                                match &mut segs[i] {
+                                    live::Seg::Text(s) => {
+                                        let id = seg_id(i);
+                                        let want = match ed.want_focus {
+                                            Some((w, pos)) if w == i || (w == usize::MAX && i == count - 1) => Some(pos),
+                                            _ => None,
+                                        };
+                                        if let Some(pos) = want {
+                                            focus_at(ctx, id, s, pos);
+                                            ed.want_focus = None;
+                                        }
+                                        // Marks show on the lines the cursor or selection touches.
+                                        let reveal = egui::TextEdit::load_state(ctx, id).and_then(|state| state.cursor.char_range()).map(|r| {
+                                            let (a, b) = (usize::from(r.primary.index), usize::from(r.secondary.index));
+                                            (a.min(b), a.max(b))
+                                        });
+                                        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap: f32| {
+                                            let job = live::layout(text.as_str(), reveal, marks, &st, wrap);
+                                            ui.fonts_mut(|f| f.layout_job(job))
+                                        };
+                                        let last = i == count - 1;
+                                        let resp = ui.add(
+                                            egui::TextEdit::multiline(s)
+                                                .id(id)
+                                                .frame(egui::Frame::NONE)
+                                                .hint_text(if count == 1 { "What's on your mind?" } else { "" })
+                                                .desired_width(f32::INFINITY)
+                                                .desired_rows(if last { 8 } else { 1 })
+                                                .layouter(&mut layouter),
+                                        );
+                                        changed |= resp.changed();
+                                        if resp.has_focus() {
+                                            ed.focus = i;
+                                            // Let the arrow keys travel past pictures into the next text block.
+                                            let (down, up) = ctx.input(|inp| (inp.key_pressed(egui::Key::ArrowDown), inp.key_pressed(egui::Key::ArrowUp)));
+                                            if down || up {
+                                                let cursor = egui::TextEdit::load_state(ctx, id)
+                                                    .and_then(|state| state.cursor.char_range())
+                                                    .map_or(0, |r| usize::from(r.primary.index));
+                                                let first_line = s.chars().take_while(|c| *c != '\n').count();
+                                                if down && cursor >= s.chars().count() {
+                                                    if let Some(j) = (i + 1..count).find(|&j| is_text[j]) {
+                                                        ed.want_focus = Some((j, 0));
+                                                    }
+                                                }
+                                                if up && cursor <= first_line {
+                                                    if let Some(j) = (0..i).rev().find(|&j| is_text[j]) {
+                                                        ed.want_focus = Some((j, usize::MAX));
+                                                        ctx.request_repaint();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    live::Seg::Image { id, alt, .. } => {
+                                        ui.add_space(4.0);
+                                        let src = format!("{}{id}", markdown::IMAGE_SCHEME);
+                                        markdown::show_image(ui, media, &data.images, &src, alt, p.ink);
+                                        let del = egui::Button::new(RichText::new("Remove picture").small().color(Color32::WHITE)).fill(RED);
+                                        if ui.add(del).clicked() {
+                                            remove = Some(i);
+                                        }
+                                        ui.add_space(4.0);
+                                    }
+                                }
+                            }
+                            if let Some(i) = remove {
+                                // Cursor goes to where the two text blocks around the picture meet.
+                                let join_at = match &segs[i - 1] {
+                                    live::Seg::Text(t) => t.chars().count(),
+                                    _ => 0,
+                                };
+                                segs.remove(i);
+                                ed.want_focus = Some((i - 1, join_at));
+                                ctx.request_repaint();
+                                changed = true;
+                            }
+                            if changed {
+                                ed.text = live::join(&segs);
+                            }
                         });
-                    };
-                    if *show_preview {
-                        ui.columns(2, |cols| {
-                            edit_pane(&mut cols[0], &mut ed.text);
-                            egui::Frame::new().fill(p.page_bg).inner_margin(10).show(&mut cols[1], |ui| {
-                                egui::ScrollArea::vertical()
-                                    .id_salt("preview_scroll")
-                                    .auto_shrink([false, false])
-                                    .max_height(height - 20.0)
-                                    .show(ui, |ui| {
-                                        ui.set_min_height(height - 24.0);
-                                        let style = markdown::Style { text: p.ink, link: p.accent, size: body };
-                                        markdown::render(ui, &ed.text, &style, media, &data.images);
-                                    });
-                            });
-                        });
-                    } else {
-                        edit_pane(ui, &mut ed.text);
-                    }
+                    });
 
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -1391,22 +1462,6 @@ fn format_selection(ctx: &egui::Context, id: egui::Id, text: &mut String, format
     ctx.memory_mut(|m| m.request_focus(id));
 }
 
-/// Insert `md` on its own line(s) at the cursor of the entry text box.
-fn insert_at_cursor(ctx: &egui::Context, id: egui::Id, text: &mut String, md: &str) {
-    use egui::text::{CCursor, CCursorRange};
-    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
-    let mut chars: Vec<char> = text.chars().collect();
-    let at = state.cursor.char_range().map_or(chars.len(), |r| usize::from(r.primary.index.max(r.secondary.index))).min(chars.len());
-    let lead = if at > 0 && chars[at - 1] != '\n' { "\n" } else { "" };
-    let insert: Vec<char> = format!("{lead}{md}\n").chars().collect();
-    let new_at = at + insert.len();
-    chars.splice(at..at, insert);
-    *text = chars.into_iter().collect();
-    state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(new_at))));
-    state.store(ctx, id);
-    ctx.memory_mut(|m| m.request_focus(id));
-}
-
 const MAX_IMAGE_SIDE: u32 = 1600;
 
 /// Read an image file, shrink it if it is large, store it in the diary data and return the
@@ -1489,4 +1544,121 @@ mod tests {
             out.textures_delta.clear();
         }
     }
+
+    fn editor_state(text: &str) -> EditState {
+        EditState {
+            id: None,
+            date: NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+            hour: 9,
+            minute: 30,
+            second: 0,
+            category: "Personal".into(),
+            text: text.into(),
+            focus: 0,
+            want_focus: None,
+        }
+    }
+
+    fn set_cursor(ctx: &egui::Context, id: egui::Id, a: usize, b: usize) {
+        use egui::text::{CCursor, CCursorRange};
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(b))));
+        state.store(ctx, id);
+    }
+
+    #[test]
+    fn toolbar_formats_the_selection_of_the_focused_block() {
+        let ctx = egui::Context::default();
+        let mut ed = editor_state("hello world");
+        set_cursor(&ctx, seg_id(0), 6, 11);
+        apply_format(&ctx, &mut ed, markdown::Format::Bold);
+        assert_eq!(ed.text, "hello **world**");
+        // The selection now covers the word, so applying it again removes the format.
+        apply_format(&ctx, &mut ed, markdown::Format::Bold);
+        assert_eq!(ed.text, "hello world");
+    }
+
+    #[test]
+    fn pictures_are_inserted_at_the_cursor_between_text_blocks() {
+        let ctx = egui::Context::default();
+        let mut ed = editor_state("hello world");
+        set_cursor(&ctx, seg_id(0), 5, 5);
+        insert_image(&ctx, &mut ed, "![p](img:i9)");
+        assert_eq!(ed.text, "hello\n![p](img:i9)\n world");
+        assert_eq!(ed.want_focus, Some((2, 0)));
+        let segs = live::split(&ed.text);
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(&segs[1], live::Seg::Image { id, .. } if id == "i9"));
+    }
+
+    #[test]
+    fn live_layout_works_inside_a_text_edit() {
+        let ctx = egui::Context::default();
+        setup_style(&ctx);
+        let st = live::LiveStyle { ink: Color32::BLACK, muted: Color32::GRAY, accent: Color32::BLUE, size: 16.0 };
+        let mut text = "# Title **b** `c`\n- item *i*\n\nplain".to_string();
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let mut layouter = |ui: &egui::Ui, t: &dyn egui::TextBuffer, wrap: f32| {
+                    ui.fonts_mut(|f| f.layout_job(live::layout(t.as_str(), None, false, &st, wrap)))
+                };
+                let shown = egui::TextEdit::multiline(&mut text).layouter(&mut layouter).show(ui);
+                assert_eq!(shown.galley.text(), "# Title **b** `c`\n- item *i*\n\nplain");
+            });
+            out.textures_delta.clear();
+        }
+    }
+}
+
+fn seg_id(i: usize) -> egui::Id {
+    egui::Id::new(("entry_seg", i))
+}
+
+/// The text block toolbar actions apply to: the one that last had the cursor.
+fn focused_text_seg(segs: &[live::Seg], focus: usize) -> usize {
+    if matches!(segs.get(focus), Some(live::Seg::Text(_))) {
+        focus
+    } else {
+        segs.iter().rposition(|s| matches!(s, live::Seg::Text(_))).unwrap_or(0)
+    }
+}
+
+fn apply_format(ctx: &egui::Context, ed: &mut EditState, format: markdown::Format) {
+    let mut segs = live::split(&ed.text);
+    let idx = focused_text_seg(&segs, ed.focus);
+    if let live::Seg::Text(s) = &mut segs[idx] {
+        format_selection(ctx, seg_id(idx), s, format);
+    }
+    ed.text = live::join(&segs);
+}
+
+/// Put the cursor at char `pos` (clamped) in a text block and give it keyboard focus.
+fn focus_at(ctx: &egui::Context, id: egui::Id, text: &str, pos: usize) {
+    use egui::text::{CCursor, CCursorRange};
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(pos.min(text.chars().count())))));
+    state.store(ctx, id);
+    ctx.memory_mut(|m| m.request_focus(id));
+}
+
+/// Insert a picture (`![alt](img:ID)`) at the cursor, splitting the text block around it.
+fn insert_image(ctx: &egui::Context, ed: &mut EditState, md: &str) {
+    let Some(picture) = live::split(md).into_iter().find(|s| matches!(s, live::Seg::Image { .. })) else {
+        return;
+    };
+    let mut segs = live::split(&ed.text);
+    let idx = focused_text_seg(&segs, ed.focus);
+    let chars: Vec<char> = match &segs[idx] {
+        live::Seg::Text(s) => s.chars().collect(),
+        _ => Vec::new(),
+    };
+    let at = egui::TextEdit::load_state(ctx, seg_id(idx))
+        .and_then(|state| state.cursor.char_range())
+        .map_or(chars.len(), |r| usize::from(r.primary.index).max(usize::from(r.secondary.index)))
+        .min(chars.len());
+    let before: String = chars[..at].iter().collect();
+    let after: String = chars[at..].iter().collect();
+    segs.splice(idx..=idx, [live::Seg::Text(before), picture, live::Seg::Text(after)]);
+    ed.text = live::join(&segs);
+    ed.want_focus = Some((idx + 2, 0));
 }
