@@ -25,7 +25,17 @@ fn app_data_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Tests must never touch the real diary, so while they run everything lives in a throw-away folder.
+fn test_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("vibe-diary-tests-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok();
+    dir
+}
+
 fn default_dir() -> PathBuf {
+    if cfg!(test) {
+        return test_dir();
+    }
     app_data_root().join(APP_FOLDER)
 }
 
@@ -88,6 +98,9 @@ static CURRENT: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// The folder holding the diary file.
 pub fn data_dir() -> PathBuf {
+    if cfg!(test) {
+        return test_dir();
+    }
     let mut current = CURRENT.lock().unwrap();
     current
         .get_or_insert_with(|| {
@@ -180,5 +193,19 @@ mod tests {
         // Moving to where it already is does nothing.
         assert!(move_diary(&from, from.parent().unwrap()).is_ok());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod isolation {
+    use super::*;
+
+    /// Tests run inside the app's own code, so they must never be pointed at the real diary.
+    #[test]
+    fn tests_never_use_the_real_diary_folder() {
+        assert!(data_dir().starts_with(std::env::temp_dir()), "{}", data_dir().display());
+        assert!(config_path().starts_with(std::env::temp_dir()));
+        let real = app_data_root().join(APP_FOLDER);
+        assert!(!data_dir().starts_with(&real) && !config_path().starts_with(&real));
     }
 }

@@ -30,6 +30,8 @@ Write down your thoughts each day with rich formatting and pictures, tag them wi
 
 **Privacy and data**
 - **Password protection.** The diary is encrypted with a password you choose, and the app asks for it every time it starts. **Lock** locks it immediately.
+- **Recovery key** (**Settings → Recovery key**): a long code, shown once, that can open the diary if you forget your password. On the unlock screen choose **Forgot your password?**, enter the key and pick a new password. You can make a new key (the old one then stops working) or remove it. You are offered one when you first create a diary.
+- **Recently deleted** (**Settings → Recently deleted**): deleting an entry moves it to a bin for 30 days, with an **Undo** straight away, **Restore**, **Delete for good** and **Empty the bin**. Pictures and attachments are kept while an entry is in the bin.
 - **Auto-lock** after a period of inactivity (default 10 minutes; change or turn off under **Settings → Auto-lock**). An entry you're in the middle of writing survives locking.
 - **Privacy screen**: the diary is hidden while its window is in the background or minimised (on by default; switch it off under **Settings**).
 - **Text size**: **Settings → Text size**, or `Ctrl +` / `Ctrl -` (and `Ctrl 0` to reset), makes everything bigger or smaller; the choice is remembered.
@@ -81,10 +83,10 @@ Earlier development builds kept the diary next to the source code. If a diary is
 
 ## Encryption
 
-- Your password is stretched into a key with **Argon2id** (64 MiB, 3 passes), and the diary is sealed with **XChaCha20-Poly1305**, which also detects a wrong password or a damaged or tampered file.
-- `entries.json` is a small JSON envelope holding the key-derivation settings, a random salt and nonce, and the ciphertext. Nothing in it reveals your entries or pictures.
+- The diary is sealed with **XChaCha20-Poly1305** under a random 256-bit data key, which also detects a damaged or tampered file. That data key is stored only in "wrapped" (encrypted) form: once under a key stretched from your password with **Argon2id** (64 MiB, 3 passes), and, if you made one, once under a key stretched from your recovery key. Either opens the diary. Changing the password re-wraps the data key, so the recovery key keeps working.
+- `entries.json` is a small JSON envelope holding the key-derivation settings, the wrapped keys, a nonce and the ciphertext. Nothing in it reveals your entries or pictures, and the recovery key itself is never stored. Diaries from before recovery keys are upgraded to this format automatically the first time you unlock them (after that, older versions of the app can't open the file).
 - Every save uses a fresh nonce, is checked by decrypting it again, and replaces the old file atomically.
-- **There is no password recovery.** If you forget the password, the diary can't be read.
+- **Without a recovery key there is no way back.** If you forget the password and have no recovery key, nobody can open the diary. That is what makes the encryption real. Keep a recovery key, or a backup whose password you remember.
 - Passwords must be at least 8 characters.
 - An unencrypted `entries.json` from an earlier version is offered for encryption the first time you run the app. It is replaced by the encrypted version and no plain-text backup is kept.
 - Text and pictures held in memory while the app is unlocked are not protected. Use **Lock** if you step away.
@@ -135,6 +137,6 @@ Once decrypted, the data looks like this:
 - `src/gallery.rs` is the Photos view and picture viewer; `src/pinned.rs` is the Pinned list; `src/faces.rs` draws the mood faces.
 - `src/export.rs` builds the PDF.
 - `src/location.rs` decides where the diary file lives and moves it.
-- `src/vault.rs` contains the password-based encryption.
+- `src/vault.rs` contains the encryption: the password, the recovery key and the wrapped data key. `src/recovery.rs` is the Recovery key window; `src/trash.rs` is Recently deleted.
 - `src/icon.rs` draws the app icon; `build.rs` turns it into the `.exe` icon.
 - `Cargo.toml` lists the dependencies: `eframe`/`egui_extras` (UI), `chrono`/`jiff` (dates), `serde`/`serde_json`, `pulldown-cmark` (Markdown), `image` (pictures), `rfd` (file dialogs), `argon2`/`chacha20poly1305`/`base64`/`getrandom` (encryption), `genpdf`/`lopdf` (PDF), and `winresource` (build only).

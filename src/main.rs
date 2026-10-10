@@ -15,8 +15,10 @@ mod insights;
 mod location;
 mod markdown;
 mod pinned;
+mod recovery;
 mod reports;
 mod stats;
+mod trash;
 mod vault;
 
 const BLUE: Color32 = Color32::from_rgb(37, 99, 235);
@@ -123,6 +125,9 @@ struct Data {
     /// Attached files: id -> base64 of the file.
     #[serde(default)]
     files: BTreeMap<String, String>,
+    /// Deleted entries, kept for 30 days.
+    #[serde(default)]
+    trash: Vec<trash::Trashed>,
     #[serde(default)]
     settings: Settings,
 }
@@ -161,7 +166,7 @@ fn default_categories() -> Vec<Category> {
 
 
 fn fresh_data() -> Data {
-    Data { categories: default_categories(), entries: Vec::new(), images: BTreeMap::new(), files: BTreeMap::new(), settings: Settings::default() }
+    Data { categories: default_categories(), entries: Vec::new(), images: BTreeMap::new(), files: BTreeMap::new(), trash: Vec::new(), settings: Settings::default() }
 }
 
 /// What is currently on disk.
@@ -266,6 +271,8 @@ enum LockMode {
     Create,
     /// Encrypted diary: enter the password.
     Unlock(vault::Envelope),
+    /// Forgot the password: unlock with the recovery key and choose a new password.
+    Recover(vault::Envelope),
     /// Unencrypted diary from an earlier version: choose a password to encrypt it.
     Encrypt(Data),
     /// The file exists but can't be used; never overwrite it.
@@ -278,11 +285,12 @@ struct Lock {
     confirm: String,
     error: String,
     focus: bool,
+    recovery_key: String,
 }
 
 impl Lock {
     fn new(mode: LockMode) -> Self {
-        Self { mode, password: String::new(), confirm: String::new(), error: String::new(), focus: true }
+        Self { mode, password: String::new(), confirm: String::new(), error: String::new(), focus: true, recovery_key: String::new() }
     }
 }
 
@@ -332,6 +340,18 @@ struct DiaryApp {
     status: String,
     media: markdown::Media,
     show_marks: bool,
+    show_recovery: bool,
+    /// The recovery key just made; shown once, then forgotten.
+    recovery_shown: Option<String>,
+    recovery_confirmed: bool,
+    recovery_msg: String,
+    /// 1 = "make a new key" clicked once, 2 = "remove" clicked once (needs a second click).
+    recovery_arm: u8,
+    recovery_hint_dismissed: bool,
+    show_trash: bool,
+    trash_arm: bool,
+    /// The entry most recently moved to the bin, for the Undo button.
+    last_trashed: Option<u64>,
     insights: insights::InsightsState,
     photos_cache: Option<(u64, Vec<gallery::Photo>)>,
     thumb_size: f32,
@@ -390,6 +410,15 @@ clear_open_files(); // leftovers from opening attachments last time
             status: String::new(),
             media: markdown::Media::default(),
             show_marks: false,
+            show_recovery: false,
+            recovery_shown: None,
+            recovery_confirmed: false,
+            recovery_msg: String::new(),
+            recovery_arm: 0,
+            recovery_hint_dismissed: false,
+            show_trash: false,
+            trash_arm: false,
+            last_trashed: None,
             insights: insights::InsightsState::default(),
             photos_cache: None,
             thumb_size: 150.0,
@@ -411,6 +440,7 @@ clear_open_files(); // leftovers from opening attachments last time
 
     fn persist(&mut self) {
         self.rev += 1;
+        self.purge_trash();
         self.drop_unused_images();
         self.status = match &self.vault {
             Some(v) => match save(&self.data, v) {
@@ -424,7 +454,7 @@ clear_open_files(); // leftovers from opening attachments last time
     /// Remove stored images that no entry (or open draft) refers to any more.
     fn drop_unused_images(&mut self) {
         let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for e in &self.data.entries {
+        for e in self.data.entries.iter().chain(self.data.trash.iter().map(|t| &t.entry)) {
             used.extend(markdown::image_ids(&e.text));
         }
         if let Some(ed) = &self.editor {
@@ -432,20 +462,32 @@ clear_open_files(); // leftovers from opening attachments last time
         }
         self.data.images.retain(|id, _| used.contains(id));
         // Attached files nobody refers to any more (including by an open draft) are dropped too.
-        let mut files: std::collections::HashSet<String> = self.data.entries.iter().flat_map(|e| e.attachments.iter().map(|a| a.id.clone())).collect();
+        let mut files: std::collections::HashSet<String> = self.data.entries.iter().chain(self.data.trash.iter().map(|t| &t.entry)).flat_map(|e| e.attachments.iter().map(|a| a.id.clone())).collect();
         if let Some(ed) = &self.editor {
             files.extend(ed.attachments.iter().map(|a| a.id.clone()));
         }
         self.data.files.retain(|id, _| files.contains(id));
     }
 
-    /// Try to unlock / create / encrypt using what was typed on the lock screen.
+    /// Try to unlock / create / encrypt / recover using what was typed on the lock screen.
     fn submit_lock(&mut self) {
         let Some(lock) = self.lock.as_mut() else { return };
         let password = lock.password.clone();
+        let new_diary = matches!(lock.mode, LockMode::Create | LockMode::Encrypt(_));
         let result: Result<(vault::Vault, Data), String> = match lock.mode.clone() {
             LockMode::Unlock(env) => vault::Vault::unlock(&env, &password).and_then(|(v, plain)| {
                 let data = serde_json::from_slice::<Data>(&plain).map_err(|e| e.to_string())?;
+                if env.is_legacy() {
+                    // Write the diary in the newer format (the one that supports a recovery key) now.
+                    save(&data, &v).ok();
+                }
+                Ok((v, data))
+            }),
+            LockMode::Recover(env) => check_new_password(&password, &lock.confirm).and_then(|()| {
+                let (mut v, plain) = vault::Vault::unlock_with_recovery(&env, &lock.recovery_key)?;
+                let data = serde_json::from_slice::<Data>(&plain).map_err(|e| e.to_string())?;
+                v.set_password(&password)?;
+                save(&data, &v)?;
                 Ok((v, data))
             }),
             LockMode::Create => create_vault(&password, &lock.confirm, fresh_data()),
@@ -461,6 +503,9 @@ clear_open_files(); // leftovers from opening attachments last time
                 self.last_activity = std::time::Instant::now();
                 self.lock = None;
                 self.status.clear();
+                // A brand-new diary is the moment to offer a recovery key.
+                self.show_recovery = new_diary;
+                self.purge_trash();
             }
             Err(e) => {
                 lock.error = e;
@@ -497,6 +542,10 @@ clear_open_files(); // leftovers from opening attachments last time
         self.show_location = false;
         self.show_export = false;
         self.show_pinned = false;
+        self.show_recovery = false;
+        self.recovery_shown = None;
+        self.show_trash = false;
+        self.last_trashed = None;
         self.focus_mode = false;
         self.show_shortcuts = false;
         self.lock = Some(Lock::new(mode));
@@ -509,65 +558,122 @@ clear_open_files(); // leftovers from opening attachments last time
         let (title, blurb, button) = match &lock.mode {
             LockMode::Create => (
                 "Welcome to My Diary",
-                "Choose a password to protect your diary. It can't be recovered if you forget it.".to_string(),
+                "Choose a password to protect your diary. You can also make a recovery key in case you forget it.".to_string(),
                 "Create password",
             ),
             LockMode::Encrypt(_) => (
                 "Protect your diary",
-                "Your diary isn't encrypted yet. Choose a password to encrypt it. It can't be recovered if you forget it."
+                "Your diary isn't encrypted yet. Choose a password to encrypt it. You can also make a recovery key in case you forget it."
                     .to_string(),
                 "Encrypt diary",
             ),
             LockMode::Unlock(_) => ("My Diary is locked", "Enter your password to open it.".to_string(), "Unlock"),
+            LockMode::Recover(env) if env.has_recovery() => (
+                "Recover your diary",
+                "Enter the recovery key you saved, then choose a new password.".to_string(),
+                "Unlock and set the new password",
+            ),
+            LockMode::Recover(_) => (
+                "No recovery key",
+                "This diary has no recovery key, so a forgotten password can't be recovered by anyone. That is what keeps it private.\n\nIf you have a copy of the diary whose password you do remember, you can open that instead."
+                    .to_string(),
+                "",
+            ),
             LockMode::Broken(why) => (
                 "Can't open the diary file",
                 format!("{}\n\nThe file was left untouched: {why}.\nFix or move it, then restart the app.", data_path().display()),
                 "",
             ),
         };
-        let needs_confirm = matches!(lock.mode, LockMode::Create | LockMode::Encrypt(_));
-        let broken = matches!(lock.mode, LockMode::Broken(_));
-        let mut submit = false;
+        let recovering = matches!(&lock.mode, LockMode::Recover(env) if env.has_recovery());
+        let needs_confirm = recovering || matches!(lock.mode, LockMode::Create | LockMode::Encrypt(_));
+        let no_fields = matches!(lock.mode, LockMode::Broken(_)) || matches!(&lock.mode, LockMode::Recover(env) if !env.has_recovery());
+        let in_recover = matches!(lock.mode, LockMode::Recover(_));
+        let can_switch = matches!(lock.mode, LockMode::Unlock(_) | LockMode::Recover(_));
+        let (mut submit, mut forgot, mut back, mut other) = (false, false, false, false);
 
         ui.vertical_centered(|ui| {
-            ui.add_space(((ui.available_height() - 380.0) / 2.0).max(16.0));
+            ui.add_space(((ui.available_height() - 420.0) / 2.0).max(16.0));
             egui::Frame::new()
                 .fill(p.panel_bg)
                 .stroke(Stroke::new(1.0, p.cell_border))
                 .shadow(popup_shadow(dark))
                 .inner_margin(28)
                 .show(ui, |ui| {
-                    ui.set_width(380.0);
+                    ui.set_width(400.0);
                     ui.label(RichText::new(title).size(28.0).strong().color(p.title));
                     ui.add_space(6.0);
                     ui.label(RichText::new(blurb).color(p.muted));
                     ui.add_space(14.0);
-                    if broken {
-                        return;
-                    }
 
-                    let r = ui.add(password_field(&mut lock.password, "Password", &p));
-                    if lock.focus {
-                        r.request_focus();
-                        lock.focus = false;
-                    }
-                    submit |= pressed_enter(&r, ui) && !needs_confirm;
-                    if needs_confirm {
-                        ui.add_space(8.0);
-                        let r2 = ui.add(password_field(&mut lock.confirm, "Confirm password", &p));
-                        submit |= pressed_enter(&r2, ui);
-                    }
-                    ui.add_space(14.0);
-                    let btn = egui::Button::new(RichText::new(button).size(17.0)).min_size(vec2(ui.available_width(), 40.0));
-                    if ui.add(btn).clicked() {
-                        submit = true;
+                    if !no_fields {
+                        if recovering {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut lock.recovery_key)
+                                    .hint_text("Recovery key (XXXX-XXXX-XXXX-…)")
+                                    .font(FontId::monospace(16.0))
+                                    .margin(egui::Margin::symmetric(12, 8))
+                                    .text_color(p.ink)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if lock.focus {
+                                r.request_focus();
+                                lock.focus = false;
+                            }
+                            ui.add_space(8.0);
+                        }
+                        let hint = if recovering { "New password" } else { "Password" };
+                        let r = ui.add(password_field(&mut lock.password, hint, &p));
+                        if lock.focus && !recovering {
+                            r.request_focus();
+                            lock.focus = false;
+                        }
+                        submit |= pressed_enter(&r, ui) && !needs_confirm;
+                        if needs_confirm {
+                            ui.add_space(8.0);
+                            let r2 = ui.add(password_field(&mut lock.confirm, if recovering { "Confirm new password" } else { "Confirm password" }, &p));
+                            submit |= pressed_enter(&r2, ui);
+                        }
+                        ui.add_space(14.0);
+                        let btn = egui::Button::new(RichText::new(button).size(17.0)).min_size(vec2(ui.available_width(), 40.0));
+                        if ui.add(btn).clicked() {
+                            submit = true;
+                        }
                     }
                     if !lock.error.is_empty() {
                         ui.add_space(8.0);
                         ui.label(RichText::new(&lock.error).color(Color32::from_rgb(239, 68, 68)));
                     }
+                    if can_switch {
+                        ui.add_space(12.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if in_recover {
+                                back = ui.link("Back to the password screen").clicked();
+                            } else {
+                                forgot = ui.link("Forgot your password?").clicked();
+                            }
+                            other = ui.link("Open a different diary…").clicked();
+                        });
+                    }
                 });
         });
+
+        if forgot {
+            if let LockMode::Unlock(env) = lock.mode.clone() {
+                self.lock = Some(Lock::new(LockMode::Recover(env)));
+            }
+        } else if back {
+            if let LockMode::Recover(env) = lock.mode.clone() {
+                self.lock = Some(Lock::new(LockMode::Unlock(env)));
+            }
+        } else if other {
+            if let Some(dir) = rfd::FileDialog::new().set_directory(location::data_dir()).pick_folder() {
+                match location::use_existing(dir) {
+                    Ok(()) => self.lock = Some(Lock::new(current_lock_mode())),
+                    Err(e) => lock.error = e,
+                }
+            }
+        }
         if submit {
             self.submit_lock();
         }
@@ -1064,6 +1170,14 @@ clear_open_files(); // leftovers from opening attachments last time
                     }
                     if ui.button("Export to PDF…").clicked() {
                         self.show_export = true;
+                        ui.close();
+                    }
+                    if ui.button("Recovery key…").on_hover_text("A code that can open the diary if you forget your password").clicked() {
+                        self.show_recovery = true;
+                        ui.close();
+                    }
+                    if ui.button(format!("Recently deleted ({})…", self.data.trash.len())).clicked() {
+                        self.show_trash = true;
                         ui.close();
                     }
                     if ui.button("Data location…").clicked() {
@@ -1639,6 +1753,18 @@ clear_open_files(); // leftovers from opening attachments last time
             ui.add_space(4.0);
             ui.label(RichText::new(&self.status).small().color(p.muted));
         }
+        // Undo for the last delete.
+        let mut undo = None;
+        if let Some(id) = self.last_trashed.filter(|id| self.data.trash.iter().any(|t| t.entry.id == *id)) {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Entry moved to Recently deleted.").small().color(p.muted));
+                if ui.small_button("Undo").clicked() {
+                    undo = Some(id);
+                }
+            });
+        }
+        self.recovery_hint(ui, &p);
         ui.add_space(8.0);
         ui.separator();
 
@@ -1770,13 +1896,15 @@ clear_open_files(); // leftovers from opening attachments last time
             self.start_edit(id);
         }
         if let Some(id) = delete {
-            self.data.entries.retain(|e| e.id != id);
-            self.persist();
+            self.trash_entry(id);
         }
         if let Some(d) = jump {
             self.selected = d;
             self.month = d.with_day(1).unwrap();
             self.day_scroll_pending = true;
+        }
+        if let Some(id) = undo {
+            self.restore_trashed(id);
         }
         if let Some(id) = toggle_pin {
             if let Some(e) = self.data.entries.iter_mut().find(|e| e.id == id) {
@@ -2518,6 +2646,8 @@ impl eframe::App for DiaryApp {
         self.password_window(&ctx);
         self.location_window(&ctx);
         self.shortcuts_window(&ctx);
+        self.recovery_window(&ctx);
+        self.trash_window(&ctx);
         self.insights_window(&ctx);
         self.lightbox_window(&ctx);
         self.pinned_window(&ctx);
@@ -3155,6 +3285,120 @@ mod tests {
         app.data.entries[0].attachments.push(Attachment { id: "f1".into(), name: "report.pdf".into(), size: 2048 });
         let report = export::Report { title: "T".into(), subtitle: "S".into(), entries: app.entries_in(from, to), include_images: false };
         assert!(export::build_pdf(&report, &app.data.categories, &app.data.images).unwrap().starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn deleted_entries_wait_in_the_bin_and_can_be_restored() {
+        let mut app = app_with_entries();
+        let id = app.data.entries[0].id;
+        app.trash_entry(id);
+        assert!(app.data.entries.iter().all(|e| e.id != id), "gone from the diary");
+        assert_eq!(app.data.trash.len(), 1);
+        assert_eq!(app.last_trashed, Some(id));
+        assert!(app.day_entries(d(2026, 10, 9)).iter().all(|e| e.id != id), "and from the calendar");
+
+        app.restore_trashed(id);
+        assert!(app.data.trash.is_empty());
+        assert!(app.data.entries.iter().any(|e| e.id == id));
+        assert_eq!(app.selected, d(2026, 10, 9), "the day it belongs to is selected");
+
+        // If its id was reused in the meantime, it comes back with a fresh one.
+        app.trash_entry(id);
+        app.data.entries.push(Entry { id, date: "2026-10-10".into(), text: "new one".into(), ..Default::default() });
+        app.restore_trashed(id);
+        let ids: std::collections::HashSet<u64> = app.data.entries.iter().map(|e| e.id).collect();
+        assert_eq!(ids.len(), app.data.entries.len(), "ids stay unique");
+        assert_eq!(app.data.entries.len(), 5);
+    }
+
+    #[test]
+    fn the_bin_empties_itself_after_thirty_days_and_keeps_pictures_meanwhile() {
+        let mut app = app_with_entries();
+        app.data.images.insert("i1".into(), "x".into());
+        app.data.files.insert("f1".into(), "x".into());
+        app.data.entries[1].text = "![p](img:i1)".into();
+        app.data.entries[1].attachments.push(Attachment { id: "f1".into(), name: "a.txt".into(), size: 1 });
+        let id = app.data.entries[1].id;
+        app.trash_entry(id);
+        // Its picture and attachment are not thrown away while it can still be restored.
+        assert!(app.data.images.contains_key("i1") && app.data.files.contains_key("f1"));
+
+        let today = Local::now().date_naive();
+        assert_eq!(app.data.trash[0].days_left(today), 30);
+        app.data.trash[0].deleted_at = format!("{} 10:00:00", key(today - chrono::Days::new(29)));
+        app.purge_trash();
+        assert_eq!(app.data.trash.len(), 1, "29 days old is still kept");
+        assert_eq!(app.data.trash[0].days_left(today), 1);
+        app.data.trash[0].deleted_at = format!("{} 10:00:00", key(today - chrono::Days::new(30)));
+        app.purge_trash();
+        assert!(app.data.trash.is_empty(), "30 days old is removed");
+        app.persist();
+        assert!(!app.data.images.contains_key("i1") && !app.data.files.contains_key("f1"), "and then its files go too");
+    }
+
+    #[test]
+    fn diaries_without_a_bin_load_and_the_bin_round_trips() {
+        let data: Data = serde_json::from_str(r#"{"categories": [], "entries": []}"#).unwrap();
+        assert!(data.trash.is_empty());
+        let mut app = app_with_entries();
+        app.trash_entry(app.data.entries[0].id);
+        let json = serde_json::to_string(&app.data).unwrap();
+        let back: Data = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.trash.len(), 1);
+        assert_eq!(back.trash[0].entry.text, "# Morning **run**");
+    }
+
+    #[test]
+    fn lock_screens_recovery_window_and_bin_render() {
+        let ctx = egui::Context::default();
+        setup_style(&ctx);
+        let mut with_key = vault::Vault::create("a password").unwrap();
+        with_key.set_recovery().unwrap();
+        let env_with = vault::Envelope::parse(&with_key.seal(b"{}").unwrap()).unwrap();
+        let env_without = vault::Envelope::parse(&vault::Vault::create("a password").unwrap().seal(b"{}").unwrap()).unwrap();
+
+        let mut app = app_with_entries();
+        for mode in [
+            LockMode::Create,
+            LockMode::Unlock(env_with.clone()),
+            LockMode::Recover(env_with),
+            LockMode::Recover(env_without),
+            LockMode::Broken("test".into()),
+        ] {
+            app.lock = Some(Lock::new(mode));
+            for _ in 0..2 {
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| app.lock_screen(ui));
+                out.textures_delta.clear();
+            }
+        }
+
+        // The recovery window in each of its three states, and the bin with something in it.
+        app.lock = None;
+        app.vault = Some(vault::Vault::create("pw").unwrap());
+        app.show_recovery = true;
+        app.data.entries.push(Entry { id: 50, date: "2026-10-01".into(), text: "x".into(), ..Default::default() });
+        app.trash_entry(50);
+        app.show_trash = true;
+        let hint_shown_before = app.recovery_hint_dismissed;
+        for state in 0..3 {
+            match state {
+                1 => app.recovery_shown = Some("ABCD-EFGH-JKMN-PQRS-TVWX-YZ01-2345-6789".into()),
+                2 => {
+                    app.recovery_shown = None;
+                    app.vault.as_mut().unwrap().set_recovery().unwrap();
+                }
+                _ => {}
+            }
+            for _ in 0..2 {
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    app.recovery_window(ui.ctx());
+                    app.trash_window(ui.ctx());
+                    app.day_panel(ui);
+                });
+                out.textures_delta.clear();
+            }
+        }
+        assert!(app.show_recovery && !hint_shown_before);
     }
     #[test]
     fn all_calendar_views_render() {
